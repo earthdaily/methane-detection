@@ -1,0 +1,49 @@
+# --- Secrets and credentials (never in image context) ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+**/credentials
+**/credentials.*
+.aws/
+.azure/
+.gcp/
+*.kube
+kubeconfig*
+*.secret
+.secrets/
+secrets/
+**/secrets/
+
+# --- Git (not needed in build) ---
+.git
+.gitattributes
+
+# --- Python (reinstall in image; exclude local env) ---
+**/.venv/
+**/venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# --- Project outputs / local data ---
+out/
+stac/
+stac_items/
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+.DS_Store
+*.log
+logs/
