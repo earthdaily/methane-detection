@@ -9,8 +9,8 @@ Python CLIs that search a STAC catalog for Sentinel-2 scenes, run a matched-filt
 | `stac_search.py` | Queries the catalog for L1C (and paired L2A) items; prints a **JSON array** to **stdout** (logs go to stderr). |
 | `process_item.py` | Processes **one** L1C item: reads bands from cloud assets (AWS requester-pays), applies L2A cloud masking when paired, runs the methane matched filter, writes GeoTIFFs/PNGs/JSON under `out/`. |
 | `aggregate_signals.py` | Scans `out/assets` for `*_time_signal.json` and writes `out/signals/items_time_signal.json` with per-datetime summary stats. |
-| `Dockerfile` | Python 3.12 image with GDAL/rasterio system deps and pinned deps from `requirements2.txt`. |
-| `requirements2.txt` | Locked Python dependencies used by the image and for local `pip install`. |
+| `Dockerfile` | Python 3.12 image with GDAL/rasterio system deps and pinned deps from `requirements.txt`. |
+| `requirements.txt` | Locked Python dependencies used by the image and for local `pip install`. |
 
 Typical flow: **search → many parallel `process_item` runs → aggregate** (aggregate only if you produced `*_time_signal.json` files).
 
@@ -28,7 +28,7 @@ From the repository root (where the `Dockerfile` lives):
 docker build -t methane-detection:latest .
 ```
 
-The image installs `requirements2.txt`, then copies `stac_search.py`, `process_item.py`, and `aggregate_signals.py` into `/app`. There is no default `CMD`; you invoke the scripts explicitly.
+The image installs `requirements.txt`, then copies `stac_search.py`, `process_item.py`, and `aggregate_signals.py` into `/app`. There is no default `CMD`; you invoke the scripts explicitly.
 
 To mount outputs and pass config:
 
@@ -41,14 +41,14 @@ docker run --rm \
   python /app/stac_search.py --help
 ```
 
-Adjust env vars and volume mount paths as needed. The `.dockerignore` file excludes local `out/`, virtualenvs, and `*.md` from the build context (the README is not copied into the image).
+Adjust env vars and volume mount paths as needed. The `.dockerignore` file excludes local `out/`, virtualenvs, secrets, and other non-runtime paths from the build context.
 
 ## Run the scripts locally (without Docker)
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
-pip install -r requirements2.txt
+pip install -r requirements.txt
 export CATALOG_URL="https://your-stac-api.example.com/"
 python stac_search.py --help
 python process_item.py --help
@@ -104,6 +104,8 @@ Optional:
 - `--skip-viz` — skip matplotlib PNGs and legend.
 - `--skip-colorized` — skip colorized heatmap COG.
 - `--skip-overviews` — single-resolution GeoTIFF outputs.
+- **`METHANE_TARGET_RES`** — JSON array of two positive floats, WGS84 degrees per pixel, e.g. `[0.00018, 0.00018]` (default matches the previous built-in resolution). Ignored when using `--auto-res` for the chosen grid resolution (snap/origin logic unchanged).
+- **`--auto-res`** — derive WGS84 pixel size from the first L1C band (`rasterio.open` once), then run the same snapped `compute_target_grid` as fixed mode. Default off preserves prior behavior when `METHANE_TARGET_RES` is unset.
 
 Example (after you have ids from search or elsewhere):
 
@@ -142,5 +144,5 @@ python aggregate_signals.py
 ## Troubleshooting
 
 - **`CATALOG_URL` not set** — both search and process exit with an error until it is defined.
-- **Rasterio / GDAL errors in Docker** — rebuild after changing `requirements2.txt`; the image pins `GDAL` and `rasterio` to versions that expect the Debian `libgdal-dev` in the Dockerfile.
+- **Rasterio / GDAL errors in Docker** — rebuild after changing `requirements.txt`; the image pins `GDAL` and `rasterio` to versions that expect the Debian `libgdal-dev` in the Dockerfile.
 - **Empty or failed reads from AWS** — confirm AWS credentials, region, and that your account accepts **requester-pays** charges for the Sentinel-2 bucket you use.
