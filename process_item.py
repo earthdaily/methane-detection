@@ -8,7 +8,6 @@ outputting results to the file system for artifact collection.
 import copy
 import json
 import logging
-import math
 import os
 import sys
 from typing import Any, Optional
@@ -51,8 +50,6 @@ STAC_ITEMS_OUT = os.path.join(OUT_DIR, "stac_items")
 ASSETS_OUT = os.path.join(OUT_DIR, "assets")
 CLEAR_MASK_CODES = [4, 5, 6, 7, 11] # Based on https://custom-scripts.sentinel-hub.com/custom-scripts/sentinel-2/scene-classification/
 
-# Fixed target grid for OpenLayers multi-source compatibility (identical GeoTransform per run)
-TARGET_RES = (0.00018, 0.00018)  # ~20 m at equator in EPSG:4326
 TARGET_CRS = "EPSG:4326"
 TARGET_BLOCK_SIZE = 256
 METHANE_RANGE = (-2.0, 2.0)
@@ -75,26 +72,6 @@ def ensure_output_directories():
     os.makedirs(OUT_DIR, exist_ok=True)
     os.makedirs(STAC_ITEMS_OUT, exist_ok=True)
     os.makedirs(ASSETS_OUT, exist_ok=True)
-
-
-def compute_target_grid(
-    bbox: list[float],
-) -> tuple[affine.Affine, int, int]:
-    """
-    Compute a snapped target grid from the AOI so all scenes in a run share the same
-    resolution, origin, CRS, and raster dimensions.
-    """
-    aoi = double_bbox(bbox)
-    minx, miny, maxx, maxy = aoi[0], aoi[1], aoi[2], aoi[3]
-    res_x, res_y = TARGET_RES[0], TARGET_RES[1]
-    minx_snap = math.floor(minx / res_x) * res_x
-    maxx_snap = math.ceil(maxx / res_x) * res_x
-    miny_snap = math.floor(miny / res_y) * res_y
-    maxy_snap = math.ceil(maxy / res_y) * res_y
-    width = int(round((maxx_snap - minx_snap) / res_x))
-    height = int(round((maxy_snap - miny_snap) / res_y))
-    transform = affine.Affine(res_x, 0, minx_snap, 0, -res_y, maxy_snap)
-    return transform, width, height
 
 
 def get_catalog_url() -> str:
@@ -721,8 +698,6 @@ def main(
     ensure_output_directories()
 
     try:
-        target_transform, target_width, target_height = compute_target_grid(bbox)
-
         # Initialize AWS session
         aws_session = AWSSession(boto3.Session(), requester_pays=True)
 
@@ -734,7 +709,6 @@ def main(
             catalog_url=catalog_url,
             download_bands_list=download_bands_list,
             aws_session=aws_session,
-            transform_properties=(target_transform, target_width, target_height),
         )
 
         if l1c_results is None:
@@ -857,4 +831,3 @@ def main(
 
 if __name__ == "__main__":
     main()
-

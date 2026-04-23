@@ -46,6 +46,7 @@ htmlcov/
 out/
 stac/
 stac_items/
+test-out/
 
 # --- IDE / OS ---
 .idea/

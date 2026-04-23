@@ -1,0 +1,23 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: local GDAL/rasterio only, no network",
+    "e2e_mocked: offline end-to-end with synthetic rasters + mocked STAC",
+    "e2e_real: hits live STAC and requester-pays S3 (requires env vars)",
+]
+addopts = "-m 'not e2e_real' --strict-markers --basetemp=./test-out"
+filterwarnings = [
+    "ignore::DeprecationWarning:rasterio",
+    "ignore::DeprecationWarning:pystac",
+]
+
+[tool.coverage.run]
+source = ["process_item", "aggregate_signals"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+]
