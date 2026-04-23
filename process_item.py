@@ -8,7 +8,6 @@ outputting results to the file system for artifact collection.
 import copy
 import json
 import logging
-import math
 import os
 import sys
 from typing import Any, Optional
@@ -51,9 +50,6 @@ STAC_ITEMS_OUT = os.path.join(OUT_DIR, "stac_items")
 ASSETS_OUT = os.path.join(OUT_DIR, "assets")
 CLEAR_MASK_CODES = [4, 5, 6, 7, 11] # Based on https://custom-scripts.sentinel-hub.com/custom-scripts/sentinel-2/scene-classification/
 
-# Snapped grid (fixed or auto-derived res) keeps identical GeoTransform per AOI for OpenLayers multi-source use.
-# Default target resolution in EPSG:4326 (~20 m at equator). Override with METHANE_TARGET_RES.
-DEFAULT_TARGET_RES = (0.00018, 0.00018)
 TARGET_CRS = "EPSG:4326"
 TARGET_BLOCK_SIZE = 256
 METHANE_RANGE = (-2.0, 2.0)
@@ -76,85 +72,6 @@ def ensure_output_directories():
     os.makedirs(OUT_DIR, exist_ok=True)
     os.makedirs(STAC_ITEMS_OUT, exist_ok=True)
     os.makedirs(ASSETS_OUT, exist_ok=True)
-
-
-def get_target_res() -> tuple[float, float]:
-    """Pixel size in degrees from METHANE_TARGET_RES JSON, e.g. [0.00018, 0.00018]."""
-    raw = os.getenv("METHANE_TARGET_RES")
-    if not raw or not raw.strip():
-        return DEFAULT_TARGET_RES
-    try:
-        parsed = json.loads(raw.strip())
-        if isinstance(parsed, (list, tuple)) and len(parsed) == 2:
-            rx, ry = float(parsed[0]), float(parsed[1])
-            if rx > 0 and ry > 0:
-                return (rx, ry)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        pass
-    logger.warning(
-        "Invalid METHANE_TARGET_RES %r; using default %s",
-        raw,
-        DEFAULT_TARGET_RES,
-    )
-    return DEFAULT_TARGET_RES
-
-
-def compute_target_grid(
-    bbox: list[float],
-    res: Optional[tuple[float, float]] = None,
-) -> tuple[affine.Affine, int, int]:
-    """
-    Compute a snapped target grid from the AOI so all scenes in a run share the same
-    resolution, origin, CRS, and raster dimensions.
-    """
-    aoi = double_bbox(bbox)
-    minx, miny, maxx, maxy = aoi[0], aoi[1], aoi[2], aoi[3]
-    res_x, res_y = res if res is not None else get_target_res()
-    minx_snap = math.floor(minx / res_x) * res_x
-    maxx_snap = math.ceil(maxx / res_x) * res_x
-    miny_snap = math.floor(miny / res_y) * res_y
-    maxy_snap = math.ceil(maxy / res_y) * res_y
-    width = int(round((maxx_snap - minx_snap) / res_x))
-    height = int(round((maxy_snap - miny_snap) / res_y))
-    transform = affine.Affine(res_x, 0, minx_snap, 0, -res_y, maxy_snap)
-    return transform, width, height
-
-
-def get_l1c_first_band_href(
-    catalog_url: str,
-    collection: str,
-    item_id: str,
-    download_bands_list: list[str],
-) -> str:
-    client = PyStacClient.open(catalog_url)
-    results = client.search(ids=[item_id], collections=[collection])
-    if results is None:
-        raise RuntimeError("No results found for the given search")
-    items = list(results.item_collection().items)
-    if len(items) == 0:
-        raise RuntimeError(f"No item found with ID: {item_id}")
-    item = items[0]
-    try:
-        return item.assets[download_bands_list[0]].href
-    except KeyError as e:
-        raise RuntimeError(f"Band not found in item assets: {e}") from e
-
-
-def estimate_wgs84_resolution_from_l1c_first_band(
-    first_band_href: str,
-    aws_session: AWSSession,
-) -> tuple[float, float]:
-    """Match read_and_reproject_data's first calculate_default_transform step (degrees in EPSG:4326)."""
-    with rasterio.Env(aws_session):
-        with rasterio.open(first_band_href) as src:
-            dst_tfm, _w, _h = rasterio.warp.calculate_default_transform(
-                src.crs,
-                rasterio.crs.CRS.from_epsg(4326),
-                src.width,
-                src.height,
-                *src.bounds,
-            )
-    return (abs(dst_tfm[0]), abs(dst_tfm[4]))
 
 
 def get_catalog_url() -> str:
@@ -749,15 +666,6 @@ def parse_list_string(ctx, param, value):
     default=False,
     help="Request single-resolution GeoTIFF outputs without overview generation.",
 )
-@click.option(
-    "--auto-res",
-    is_flag=True,
-    default=False,
-    help=(
-        "Derive WGS84 pixel size from the first L1C band (one rasterio.open), "
-        "then snap with compute_target_grid. Default uses METHANE_TARGET_RES / built-in default only."
-    ),
-)
 def main(
     bbox: list[float],
     collection: str,
@@ -767,7 +675,6 @@ def main(
     skip_viz: bool = False,
     skip_colorized: bool = False,
     skip_overviews: bool = False,
-    auto_res: bool = False,
 ):
     """
     Process a single STAC item for methane detection.
@@ -791,30 +698,8 @@ def main(
     ensure_output_directories()
 
     try:
+        # Initialize AWS session
         aws_session = AWSSession(boto3.Session(), requester_pays=True)
-
-        grid_res: Optional[tuple[float, float]] = None
-        if auto_res:
-            first_href = get_l1c_first_band_href(
-                catalog_url,
-                collection,
-                l1c_item_id,
-                download_bands_list,
-            )
-            grid_res = estimate_wgs84_resolution_from_l1c_first_band(
-                first_href,
-                aws_session,
-            )
-            logger.info(
-                "Using --auto-res derived resolution (degrees): res_x=%s, res_y=%s",
-                grid_res[0],
-                grid_res[1],
-            )
-
-        target_transform, target_width, target_height = compute_target_grid(
-            bbox,
-            res=grid_res,
-        )
 
         # Read and reproject data
         l1c_results = read_and_reproject_data(
@@ -824,7 +709,6 @@ def main(
             catalog_url=catalog_url,
             download_bands_list=download_bands_list,
             aws_session=aws_session,
-            transform_properties=(target_transform, target_width, target_height),
         )
 
         if l1c_results is None:
@@ -947,4 +831,3 @@ def main(
 
 if __name__ == "__main__":
     main()
-
