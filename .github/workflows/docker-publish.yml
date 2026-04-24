@@ -15,8 +15,8 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
     # Uses existing repo/org secrets:
-    #   DOCKER_HUB_USER     — Docker Hub login with push rights on earthdaily
-    #   DOCKER_HUB_PASSWORD — Password or Personal Access Token for that account
+    #   DOCKERHUB_USERNAME — Docker Hub login with push rights on earthdaily
+    #   DOCKERHUB_PASSWORD — Password or Personal Access Token for that account
     env:
       IMAGE: earthdaily/methane-detection
     steps:
