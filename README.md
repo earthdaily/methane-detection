@@ -9,6 +9,8 @@ Python CLIs that search a STAC catalog for Sentinel-2 scenes, run a matched-filt
 | `stac_search.py` | Queries the catalog for L1C (and paired L2A) items; prints a **JSON array** to **stdout** (logs go to stderr). |
 | `process_item.py` | Processes **one** L1C item: reads bands from cloud assets (AWS requester-pays), applies L2A cloud masking when paired, runs the methane matched filter, writes GeoTIFFs/PNGs/JSON under `out/`. |
 | `aggregate_signals.py` | Scans `out/assets` for `*_time_signal.json` and writes `out/signals/items_time_signal.json` with per-datetime summary stats. |
+| `run_pipeline.py` | Runs the complete flow: STAC search, per-item processing, and signal aggregation. |
+| `app-package.cwl` | EOAP/CWL Workflow package for deploying the complete flow as an OGC API Processes-style application. |
 | `Dockerfile` | Python 3.12 image with GDAL/rasterio system deps and pinned deps from `requirements.txt`. |
 | `requirements.txt` | Locked Python dependencies used by the image and for local `pip install`. |
 
@@ -28,7 +30,7 @@ From the repository root (where the `Dockerfile` lives):
 docker build -t methane-detection:latest .
 ```
 
-The image installs `requirements.txt`, then copies `stac_search.py`, `process_item.py`, and `aggregate_signals.py` into `/app`. There is no default `CMD`; you invoke the scripts explicitly.
+The image installs `requirements.txt`, then copies `stac_search.py`, `process_item.py`, `aggregate_signals.py`, and `run_pipeline.py` into `/app`. There is no default `CMD`; you invoke the scripts explicitly.
 
 To mount outputs and pass config:
 
@@ -53,6 +55,7 @@ export CATALOG_URL="https://your-stac-api.example.com/"
 python stac_search.py --help
 python process_item.py --help
 python aggregate_signals.py --help
+python run_pipeline.py --help
 ```
 
 You still need GDAL/rasterio-compatible system libraries on the host (the Dockerfile shows the Debian packages used in the container).
@@ -129,6 +132,32 @@ python aggregate_signals.py \
 ```
 
 This creates `out/signals/items_time_signal.json` (or an empty structure if no matching files exist). If there are no `*_time_signal.json` files, the command still writes an empty aggregate file and logs a warning.
+
+### `run_pipeline.py`
+
+Runs the full search → process → aggregate flow in one command. This is the executable used by `app-package.cwl`.
+
+```bash
+export CATALOG_URL="https://your-stac-api.example.com/"
+python run_pipeline.py \
+  --bbox '[-3.67, 40.23, -3.61, 40.29]' \
+  --start_datetime 2023-01-01T00:00:00Z \
+  --end_datetime 2023-01-24T23:59:59Z \
+  --limit 5
+```
+
+### `app-package.cwl`
+
+The EOAP package is a CWL `Workflow` that exposes the complete repository capability through `run_pipeline.py` and writes the `out/` directory as the workflow output.
+
+```bash
+cwltool app-package.cwl \
+  --bbox '[-3.67, 40.23, -3.61, 40.29]' \
+  --start_datetime 2023-01-01T00:00:00Z \
+  --end_datetime 2023-01-24T23:59:59Z \
+  --limit 5 \
+  --catalog_url https://earth-search.aws.element84.com/v1
+```
 
 ## End-to-end shell sketch
 

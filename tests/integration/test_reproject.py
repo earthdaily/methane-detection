@@ -7,7 +7,6 @@ no AWS — just GDAL/rasterio.
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import affine
@@ -64,9 +63,9 @@ def test_reads_l1c_and_returns_expected_shape(
     assert isinstance(dst_tfm, affine.Affine)
     # Output CRS is EPSG:4326 regardless of input CRS; transform pixel size is in degrees.
     assert abs(dst_tfm[0]) < 1.0
-    # Item metadata was persisted to STAC_ITEMS_OUT.
-    saved = json.loads((tmp_path / "stac_items" / "S2A_L1C_TEST.json").read_text())
-    assert saved["id"] == "S2A_L1C_TEST"
+    # Item metadata is returned for the final output STAC writer.
+    assert item_dict["id"] == "S2A_L1C_TEST"
+    assert item_dict["properties"]["platform"] == "sentinel-2a"
 
 
 def test_transform_properties_overrides_derivation(
