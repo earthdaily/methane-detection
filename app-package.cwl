@@ -94,6 +94,8 @@ $graph:
       EnvVarRequirement:
         envDef:
           CATALOG_URL: $(inputs.catalog_url)
+      NetworkAccess:
+        networkAccess: true
       ResourceRequirement:
         coresMin: 2
         ramMin: 4096
