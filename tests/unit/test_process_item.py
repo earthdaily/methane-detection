@@ -219,6 +219,129 @@ class TestWriteTimeSignalJson:
         assert payload["values"] == values
 
 
+class TestStacOutput:
+    def test_build_output_stac_item_uses_generated_relative_assets(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        out_dir = tmp_path / "out"
+        assets_dir = out_dir / "assets"
+        assets_dir.mkdir(parents=True)
+        monkeypatch.setattr(pi, "ASSETS_OUT", str(assets_dir))
+
+        item_id = "S2A_L1C_TEST"
+        for filename in (
+            f"{item_id}_methane_enhancement.tif",
+            f"{item_id}_averaged_methane_enhancement.tif",
+            f"{item_id}_time_signal.json",
+            f"{item_id}_methane_enhancement_colorized.tif",
+            f"{item_id}_methane_enhancement.png",
+        ):
+            (assets_dir / filename).write_text("dummy")
+
+        source = {
+            "type": "Feature",
+            "stac_version": "1.0.0",
+            "id": item_id,
+            "properties": {"datetime": "2023-01-06T11:20:00Z"},
+            "geometry": None,
+            "bbox": None,
+            "links": [],
+            "assets": {"source": {"href": "s3://example/source.tif"}},
+        }
+        bbox = [-3.67, 40.23, -3.61, 40.29]
+
+        item = pi.build_output_stac_item(source, bbox, item_id, False, False)
+
+        assert item["bbox"] == bbox
+        assert item["geometry"]["coordinates"][0][0] == [bbox[0], bbox[1]]
+        assert set(item["assets"]) == {
+            "methane-enhancement",
+            "averaged-methane-enhancement",
+            "time-signal",
+            "methane-enhancement-colorized",
+            "thumbnail",
+        }
+        assert item["assets"]["methane-enhancement"]["href"] == (
+            f"../assets/{item_id}_methane_enhancement.tif"
+        )
+        assert item["assets"]["thumbnail"]["roles"] == ["thumbnail"]
+        assert item["links"] == [
+            {"rel": "self", "href": f"./{item_id}.json", "type": "application/json"},
+            {"rel": "root", "href": "../catalog.json", "type": "application/json"},
+            {"rel": "parent", "href": "../catalog.json", "type": "application/json"},
+        ]
+
+    def test_build_output_stac_item_omits_missing_assets(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        assets_dir = tmp_path / "out" / "assets"
+        assets_dir.mkdir(parents=True)
+        monkeypatch.setattr(pi, "ASSETS_OUT", str(assets_dir))
+
+        item_id = "S2A_L1C_TEST"
+        (assets_dir / f"{item_id}_methane_enhancement.tif").write_text("dummy")
+        source = {
+            "type": "Feature",
+            "stac_version": "1.0.0",
+            "id": item_id,
+            "properties": {"datetime": "2023-01-06T11:20:00Z"},
+            "geometry": None,
+            "bbox": None,
+            "links": [],
+            "assets": {},
+        }
+
+        item = pi.build_output_stac_item(
+            source,
+            [-3.67, 40.23, -3.61, 40.29],
+            item_id,
+            skip_viz=False,
+            skip_colorized=False,
+        )
+
+        assert set(item["assets"]) == {"methane-enhancement"}
+
+    def test_write_stac_output_writes_item_and_catalog(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        out_dir = tmp_path / "out"
+        stac_items_dir = out_dir / "stac_items"
+        stac_items_dir.mkdir(parents=True)
+        monkeypatch.setattr(pi, "OUT_DIR", str(out_dir))
+        monkeypatch.setattr(pi, "STAC_ITEMS_OUT", str(stac_items_dir))
+
+        item_id = "S2A_L1C_TEST"
+        item = {
+            "type": "Feature",
+            "stac_version": "1.0.0",
+            "id": item_id,
+            "properties": {"datetime": "2023-01-06T11:20:00Z"},
+            "geometry": None,
+            "bbox": None,
+            "links": [],
+            "assets": {},
+        }
+
+        pi.write_stac_output(item, item_id)
+
+        written_item = json.loads((stac_items_dir / f"{item_id}.json").read_text())
+        catalog = json.loads((out_dir / "catalog.json").read_text())
+        assert written_item == item
+        assert catalog["type"] == "Catalog"
+        assert catalog["stac_version"] == "1.0.0"
+        assert catalog["links"][-1] == {
+            "rel": "item",
+            "href": f"./stac_items/{item_id}.json",
+            "type": "application/json",
+        }
+
+
 class TestGetCatalogUrl:
     def test_missing_env_exits(self, monkeypatch):
         monkeypatch.delenv("CATALOG_URL", raising=False)
