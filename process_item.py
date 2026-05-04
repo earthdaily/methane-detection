@@ -15,6 +15,7 @@ from typing import Any, Optional
 import affine
 import boto3
 import click
+import providers
 import cv2
 import matplotlib
 matplotlib.use("Agg")
@@ -56,6 +57,21 @@ METHANE_RANGE = (-2.0, 2.0)
 AVERAGED_RANGE = (-0.15, 0.15)
 IME_PERCENTILE = 95
 
+def build_s3_session(stac_provider: str) -> AWSSession:
+    """Create an S3 session appropriate for the given STAC provider."""
+    cfg = providers.get_provider_config(stac_provider)
+    if cfg.s3_endpoint_url is not None:
+        # AWSSession passes endpoint_url to GDAL as AWS_S3_ENDPOINT, which expects
+        # a bare hostname — strip the scheme or GDAL tries to resolve "https" as a host.
+        hostname = cfg.s3_endpoint_url.removeprefix("https://").removeprefix("http://")
+        return AWSSession(
+            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+            endpoint_url=hostname,
+        )
+    boto_session = boto3.Session(region_name=os.getenv("AWS_REGION", cfg.s3_region))
+    return AWSSession(boto_session, requester_pays=cfg.requester_pays)
+
 
 def double_bbox(bbox: list[float]) -> list[float]:
     """Expand a bounding box around its center by a factor of two."""
@@ -72,16 +88,6 @@ def ensure_output_directories():
     os.makedirs(OUT_DIR, exist_ok=True)
     os.makedirs(STAC_ITEMS_OUT, exist_ok=True)
     os.makedirs(ASSETS_OUT, exist_ok=True)
-
-
-def get_catalog_url() -> str:
-    """Get the STAC catalog URL from the environment."""
-    catalog_url = os.getenv("CATALOG_URL", "")
-    if not catalog_url:
-        logger.error("CATALOG_URL environment variable not set")
-        sys.exit(1)
-    logger.info(f"Catalog URL: {catalog_url}")
-    return catalog_url
 
 
 def save_figure(
@@ -159,16 +165,20 @@ def apply_l2a_cloud_mask(
     width: int,
     height: int,
     out_img: np.ndarray,
+    stac_provider: str = "e84",
+    env_kwargs: Optional[dict] = None,
 ) -> np.ndarray:
     """Apply L2A-derived cloud mask and export RGB visualization."""
+    l2a_bands = providers.get_provider_config(stac_provider).l2a_band_keys
     l2a_results = read_and_reproject_data(
         bbox=bbox,
         collection="sentinel-2-l2a",
         item_id=l2a_item_id,
         catalog_url=catalog_url,
-        download_bands_list=["scl", "visual"],
+        download_bands_list=l2a_bands,
         aws_session=aws_session,
         transform_properties=(dst_tfm, width, height),
+        env_kwargs=env_kwargs,
     )
     if l2a_results is None:
         logger.warning(f"Skipping L2A masking because item could not be read: {l2a_item_id}")
@@ -283,6 +293,7 @@ def read_and_reproject_data(
     download_bands_list: list[str],
     aws_session: AWSSession,
     transform_properties: Optional[tuple[affine.Affine, int, int]] = None,
+    env_kwargs: Optional[dict] = None,
 ) -> Optional[tuple[np.ndarray, str, affine.Affine, int, int, dict[str, Any]]]:
     """
     Read STAC item and reproject bands to target bbox.
@@ -324,9 +335,18 @@ def read_and_reproject_data(
     logger.info(f"Platform: {platform}")
 
     # Get band HREFs
+    resolved_bands = []
+    for band in download_bands_list:
+        if band in item.assets:
+            resolved_bands.append(band)
+        else:
+            logger.error(f"Band not found in item assets: '{band}'")
+            return None
+    download_bands_list = resolved_bands
     try:
         band_hrefs = [item.assets[band].href for band in download_bands_list]
         logger.info(f"Bands to download: {download_bands_list}")
+        logger.info(f"Band hrefs: {band_hrefs}")
     except KeyError as e:
         logger.error(f"Band not found in item assets: {e}")
         return None
@@ -338,7 +358,7 @@ def read_and_reproject_data(
     # Read and reproject the data
     logger.info(f"Reading and re-projecting data for platform {platform}")
 
-    with rasterio.Env(aws_session):
+    with rasterio.Env(aws_session, **(env_kwargs or {})):
         if transform_properties is not None:
             dst_tfm, width, height = transform_properties
 
@@ -365,10 +385,15 @@ def read_and_reproject_data(
 
         logger.info(f"Target dimensions: {width}x{height}")
 
-        # Prepare output array
+        # Prepare output array. RGB visual bands carry 3 sub-bands each, so
+        # the destination band count grows by 2 for every RGB key in the request.
         num_bands = len(download_bands_list)
-        if 'visual' in download_bands_list: # visual is 3 bands so add more to get correct number of bands
-            num_bands += 2
+        rgb_keys = {
+            key
+            for cfg in providers.PROVIDERS.values()
+            for key in cfg.l2a_rgb_band_keys
+        }
+        num_bands += 2 * sum(1 for b in download_bands_list if b in rgb_keys)
 
         out_img = np.empty((num_bands, height, width), dtype=np.float32)
 
@@ -729,7 +754,9 @@ def write_stac_catalog(item_ids: list[str]) -> None:
 
 
 def parse_list_string(ctx, param, value):
-    """Parse JSON string to Python list (Click callback)."""
+    """Parse JSON string to Python list (Click callback). Returns None if value is None."""
+    if value is None:
+        return None
     try:
         return json.loads(value)
     except ValueError as e:
@@ -763,11 +790,12 @@ def parse_list_string(ctx, param, value):
     help="Optional L2A STAC item ID for cloud masking and RGB",
 )
 @click.option(
-    "--download_bands_list",
+    "--download-bands-list",
+    "download_bands_list",
     callback=parse_list_string,
     required=False,
-    default='["B11.jp2", "B12.jp2"]',
-    help="Bands to download as JSON list (default: [\"B11.jp2\", \"B12.jp2\"])",
+    default=None,
+    help="Bands to download as JSON list. Defaults to provider-appropriate bands if not set.",
 )
 @click.option(
     "--skip-viz/--no-viz",
@@ -790,15 +818,24 @@ def parse_list_string(ctx, param, value):
     default=False,
     help="Request single-resolution GeoTIFF outputs without overview generation.",
 )
+@click.option(
+    "--stac-provider",
+    "stac_provider",
+    type=click.Choice(["e84", "cdse", "ed"]),
+    default="e84",
+    show_default=True,
+    help="STAC backend provider. 'cdse'/'ed' use CDSE-style S3 credentials and band key conventions.",
+)
 def main(
     bbox: list[float],
     collection: str,
     l1c_item_id: str,
     l2a_item_id: Optional[str] = None,
-    download_bands_list: list[str] = ['B11.jp2', 'B12.jp2'],
+    download_bands_list: Optional[list[str]] = None,
     skip_viz: bool = False,
     skip_colorized: bool = False,
     skip_overviews: bool = False,
+    stac_provider: str = "e84",
 ):
     """
     Process a single STAC item for methane detection.
@@ -814,16 +851,26 @@ def main(
     expanded_bbox = double_bbox(bbox)
     logger.info(f"Bbox: {expanded_bbox}")
     logger.info(f"Collection: {collection}")
+    logger.info(f"STAC provider: {stac_provider}")
+
+    provider_cfg = providers.get_provider_config(stac_provider)
+    if download_bands_list is None:
+        download_bands_list = list(provider_cfg.l1c_band_keys)
     logger.info(f"Bands: {download_bands_list}")
 
-    catalog_url = get_catalog_url()
+    try:
+        catalog_url = providers.resolve_catalog_url(stac_provider)
+    except RuntimeError as e:
+        logger.error(str(e))
+        sys.exit(1)
 
     # Ensure output directories exist
     ensure_output_directories()
 
+    env_kwargs: dict = {"AWS_VIRTUAL_HOSTING": False, "AWS_HTTPS": "YES"} if not provider_cfg.s3_virtual_hosting else {}
+
     try:
-        # Initialize AWS session
-        aws_session = AWSSession(boto3.Session(), requester_pays=True)
+        aws_session = build_s3_session(stac_provider)
 
         # Read and reproject data
         l1c_results = read_and_reproject_data(
@@ -833,6 +880,7 @@ def main(
             catalog_url=catalog_url,
             download_bands_list=download_bands_list,
             aws_session=aws_session,
+            env_kwargs=env_kwargs,
         )
 
         if l1c_results is None:
@@ -855,6 +903,8 @@ def main(
                 width=width,
                 height=height,
                 out_img=out_img,
+                stac_provider=stac_provider,
+                env_kwargs=env_kwargs,
             )
 
         # Normalize inputs (convert from digital numbers to reflectance)

@@ -6,13 +6,16 @@ outputting a JSON array of item IDs to stdout for use in Argo workflow fan-out.
 """
 import json
 import logging
-import os
 import sys
 from shapely import geometry
 
 import pystac
 import click
+import requests
 from pystac_client import Client as PyStacClient
+from pystac_client.exceptions import APIError
+
+import providers
 
 # Configure logging to stderr so stdout is clean for JSON output
 logging.basicConfig(
@@ -27,8 +30,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_BBOX = [-3.67, 40.23, -3.61, 40.29]
 DEFAULT_PRIMARY_COLLECTION = "sentinel-2-l1c"
 DEFAULT_SECONDARY_COLLECTION = "sentinel-2-l2a"
-DEFAULT_START_DATETIME = "2023-01-01T00:00:00Z"
-DEFAULT_END_DATETIME = "2023-01-24T23:59:59Z"
+DEFAULT_START_DATETIME = "2025-01-01T00:00:00Z"
+DEFAULT_END_DATETIME = "2025-01-24T23:59:59Z"
 DEFAULT_CLOUD_COVER = 10.0
 DEFAULT_LIMIT = 10
 MIN_L2A_PAIRING_LIMIT = 50
@@ -139,6 +142,7 @@ def search_stac(
     catalog_url: str,
     cloud_cover: float | None = None,
     limit: int | None = None,
+    stac_provider: str = "e84",
 ) -> list[pystac.Item]:
     """
     Search STAC catalog for items matching the given criteria.
@@ -149,8 +153,9 @@ def search_stac(
         end_datetime: End datetime in ISO format
         collection: STAC collection to search
         catalog_url: URL of the STAC catalog
-        cloud_cover: Optional max cloud cover (eo:cloud_cover<=value). Requires Query extension.
+        cloud_cover: Optional max cloud cover (eo:cloud_cover<=value).
         limit: Optional max number of items to return (passed as max_items).
+        stac_provider: Backend provider ("e84" uses Query extension; "cdse" uses CQL2).
 
     Returns:
         List of STAC items matching the search criteria
@@ -174,7 +179,14 @@ def search_stac(
         "datetime": datetime_range,
     }
     if cloud_cover is not None:
-        search_kw["query"] = {"eo:cloud_cover": {"lte": cloud_cover}}
+        if providers.get_provider_config(stac_provider).use_cql2_filter:
+            search_kw["filter"] = {
+                "op": "<=",
+                "args": [{"property": "eo:cloud_cover"}, cloud_cover],
+            }
+            search_kw["filter_lang"] = "cql2-json"
+        else:
+            search_kw["query"] = {"eo:cloud_cover": {"lte": cloud_cover}}
     if limit is not None:
         search_kw["max_items"] = limit
 
@@ -196,14 +208,16 @@ def search_stac(
     help="Bounding box as JSON list [west, south, east, north]",
 )
 @click.option(
-    "--start_datetime",
+    "--start-datetime",
+    "start_datetime",
     required=False,
     default=DEFAULT_START_DATETIME,
     show_default=True,
     help="Start datetime in ISO format (e.g., 2023-01-01T00:00:00Z)",
 )
 @click.option(
-    "--end_datetime",
+    "--end-datetime",
+    "end_datetime",
     required=False,
     default=DEFAULT_END_DATETIME,
     show_default=True,
@@ -230,13 +244,15 @@ def search_stac(
     help="Secondary STAC collection used for L2A pairing",
 )
 @click.option(
-    "--catalog_url",
+    "--catalog-url",
+    "catalog_url",
     required=False,
     default=None,
     help="STAC catalog URL (defaults to CATALOG_URL env var)",
 )
 @click.option(
-    "--cloud_cover",
+    "--cloud-cover",
+    "cloud_cover",
     callback=parse_optional_float,
     default=str(DEFAULT_CLOUD_COVER),
     show_default=True,
@@ -249,6 +265,14 @@ def search_stac(
     show_default=True,
     help="Max number of L1C items to return.",
 )
+@click.option(
+    "--stac-provider",
+    "stac_provider",
+    type=click.Choice(["e84", "cdse", "ed"]),
+    default="e84",
+    show_default=True,
+    help="STAC backend provider. 'e84' uses the Query extension; 'cdse'/'ed' use CQL2 filters.",
+)
 def main(
     bbox: list[float],
     start_datetime: str,
@@ -259,6 +283,7 @@ def main(
     catalog_url: str | None,
     cloud_cover: float | None,
     limit: int | None,
+    stac_provider: str,
 ):
     """
     Search STAC catalog and output item IDs as JSON array to stdout.
@@ -270,9 +295,10 @@ def main(
     primary_collection = collection or collection1
 
     if catalog_url is None:
-        catalog_url = os.getenv("CATALOG_URL", "")
-        if not catalog_url:
-            logger.error("No catalog URL provided and CATALOG_URL env var not set")
+        try:
+            catalog_url = providers.resolve_catalog_url(stac_provider)
+        except RuntimeError as e:
+            logger.error(str(e))
             sys.exit(1)
 
     try:
@@ -284,6 +310,7 @@ def main(
             catalog_url=catalog_url,
             cloud_cover=cloud_cover,
             limit=limit,
+            stac_provider=stac_provider,
         )
 
         l1c_items = deduplicate_items(l1c_items)
@@ -297,6 +324,7 @@ def main(
             catalog_url=catalog_url,
             cloud_cover=cloud_cover,
             limit=l2a_limit,
+            stac_provider=stac_provider,
         )
 
         l2a_items = deduplicate_items(l2a_items)
@@ -305,8 +333,8 @@ def main(
         # Output JSON array to stdout for Argo withParam
         print(json.dumps(output_obj))
 
-    except Exception as e:
-        logger.error(f"Search failed: {e}")
+    except (APIError, requests.RequestException) as e:
+        logger.error(f"STAC/HTTP error during search: {e}")
         sys.exit(1)
 
 

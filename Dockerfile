@@ -28,3 +28,4 @@ COPY stac_search.py /app
 COPY process_item.py /app
 COPY aggregate_signals.py /app
 COPY run_pipeline.py /app
+COPY providers.py /app

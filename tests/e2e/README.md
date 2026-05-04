@@ -2,93 +2,107 @@
 
 Two modes:
 
-| Marker | Network? | AWS? | Runs by default? |
+| Marker | Network? | S3? | Runs by default? |
 |---|---|---|---|
 | `e2e_mocked` | No | No | Yes |
-| `e2e_real`   | Yes (live STAC) | Yes (requester-pays S3) | No, opt-in |
+| `e2e_real` | Yes (live STAC) | Yes | No, opt-in |
 
-## Command cheat sheet
+## How `e2e_mocked` stays offline
+
+These tests do not commit any binary fixtures. Every run generates fresh
+synthetic GeoTIFFs in `tmp_path` via the `synthetic_l1c_band`,
+`synthetic_l2a_scl`, and `synthetic_l2a_visual` fixtures in
+[`tests/conftest.py`](../conftest.py), and points STAC item assets at those
+files via `file://` URLs. `PyStacClient` and `boto3.Session` are
+monkey-patched so no network or AWS call is ever attempted. Adding a new
+provider to the mocked matrix means: (a) new branch in
+`_build_mocked_pipeline` mapping the provider's asset key names onto the same
+synthetic rasters, and (b) a fixture + smoke test mirroring the existing
+`e84` / `cdse` / `ed` ones — no fixture files needed.
+
+## Run commands
 
 ```bash
-# Everything that runs without network (default)
+# All tests that run without credentials (default)
 pytest
 
-# Just unit
-pytest tests/unit
-
-# Just integration (synthetic GeoTIFF + mocked STAC)
-pytest tests/integration
-
-# Mocked end-to-end (synthetic pipeline)
+# Mocked end-to-end only
 pytest -m e2e_mocked
 
-# Live end-to-end (see env vars below)
-pytest -m e2e_real
+# Real E2E — all providers (skips whichever has no creds set)
+pytest -m e2e_real -v
 
-# Everything, including real
-pytest -m ''
+# Real E2E — single provider
+pytest -m e2e_real -k e84   -v
+pytest -m e2e_real -k cdse  -v
+pytest -m e2e_real -k ed    -v
+
+# Everything including real
+pytest -m '' -v
 ```
 
-## Running the real E2E suite
+---
 
-The real tests chain the production topology end-to-end:
+## Provider env var setup
 
-```
-stac_search.py  ->  process_item.py (per item)  ->  aggregate_signals.py
-```
+### e84 — Element84 Earth Search
 
-They expect the **same env vars `process_item.py` itself reads at runtime**.
-
-### Required env vars
+Catalog URL is hardcoded (`https://earth-search.aws.element84.com/v1`).
+Only S3 credentials are required.
 
 ```bash
-export CATALOG_URL="https://earth-search.aws.element84.com/v1"
 export AWS_ACCESS_KEY_ID="..."
 export AWS_SECRET_ACCESS_KEY="..."
-export AWS_REGION="us-west-2"           # Sentinel-2 L1C/L2A bucket region
-# Optional, normally picked up from AWS_PROFILE or the default chain
-# export AWS_SESSION_TOKEN="..."
+export AWS_REGION="us-west-2"          # optional, defaults to us-west-2
 ```
 
-If any required var is missing, the real tests skip cleanly with a message
-listing what's missing — no red failures.
+---
 
-### Test parameters (well-tested defaults)
+### cdse — Copernicus Data Space Ecosystem
 
-The suite ships with the exact parameters used for routine manual QA of
-the pipeline. No env vars are required for these to work — they're the
-hard-coded defaults:
-
-| Parameter | Default |
-|---|---|
-| bbox | `[-3.67, 40.23, -3.61, 40.29]` |
-| start_datetime | `2023-01-01T00:00:00Z` |
-| end_datetime | `2023-01-31T23:59:59Z` |
-| cloud_cover | `10` |
-| limit | `10` |
-
-You can override any of them per-run if needed:
+Catalog URL is hardcoded (`https://stac.dataspace.copernicus.eu/v1/`).
+Only CDSE S3 credentials are required.
+Get them from: https://eodata-s3keysmanager.dataspace.copernicus.eu
 
 ```bash
-export METHANE_E2E_BBOX='[...]'
-export METHANE_E2E_START='2023-02-01T00:00:00Z'
-export METHANE_E2E_END='2023-02-28T23:59:59Z'
-export METHANE_E2E_CLOUD_COVER='20'
-export METHANE_E2E_LIMIT='5'
+export AWS_ACCESS_KEY_ID="..."
+export AWS_SECRET_ACCESS_KEY="..."
 ```
 
-### Running
+---
+
+### ed — EDA
+
+No hardcoded catalog URL — you must supply it via `CATALOG_URL`.
+Same AWS S3 backend as `e84` (requester-pays, `us-west-2`).
 
 ```bash
-pytest -m e2e_real -v
+export CATALOG_URL="https://your-eda-stac-endpoint/v1"
+export AWS_ACCESS_KEY_ID="..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_REGION="us-west-2"
 ```
 
-Each test spawns subprocesses and writes outputs under `pytest`'s
-`tmp_path`, so repeated runs are isolated. First-run times of a few
-minutes per test are normal (Sentinel-2 tiles are ~100 MB each).
+---
 
-### Troubleshooting
+## Override test parameters
 
-- **403 from S3** — requester-pays requires authenticated credentials. `AWSSession(..., requester_pays=True)` handles the header, but the creds still need to be valid. Verify `aws sts get-caller-identity` first.
-- **Empty search payload** — no L1C items matched the AOI/date/cloud filter. Either expand the window or lower the cloud threshold.
-- **Hit rate limits or slow** — set `METHANE_E2E_LIMIT=1` or `METHANE_E2E_LIMIT=2` to process fewer items per run.
+The suite ships with defaults that cover a well-tested AOI over central Spain.
+Override any of them per run:
+
+```bash
+export METHANE_E2E_BBOX='[-3.67, 40.23, -3.61, 40.29]'
+export METHANE_E2E_START='2025-01-01T00:00:00Z'
+export METHANE_E2E_END='2025-01-31T23:59:59Z'
+export METHANE_E2E_CLOUD_COVER='10'
+export METHANE_E2E_LIMIT='10'         # set to 1 or 2 for faster runs
+```
+
+---
+
+## Troubleshooting
+
+- **Provider skipped** — check the skip message; it lists the exact missing env vars.
+- **403 from S3** — credentials are invalid or expired. For e84, verify with `aws sts get-caller-identity`.
+- **Empty search results** — no items matched the AOI/date/cloud filter. Lower `METHANE_E2E_CLOUD_COVER` or widen the date range.
+- **Slow runs** — set `METHANE_E2E_LIMIT=1` to process one item only.

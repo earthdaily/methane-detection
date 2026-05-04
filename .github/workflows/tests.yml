@@ -1,0 +1,86 @@
+name: Tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: Unit + Integration + Mocked E2E
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install system GDAL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gdal-bin libgdal-dev
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Run tests (default markers: skips e2e_real)
+        run: pytest --cov=. --cov-report=term-missing --cov-report=xml -v
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: ignore
+
+  e2e-real:
+    name: Live STAC + S3 E2E
+    runs-on: ubuntu-latest
+    # Opt-in only: runs when a maintainer manually dispatches this workflow
+    # and explicitly enables the real-E2E job. Keeps requester-pays S3 costs
+    # predictable and avoids hitting rate limits on PR traffic.
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install system GDAL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gdal-bin libgdal-dev
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Run real E2E
+        env:
+          CATALOG_URL: ${{ secrets.CATALOG_URL }}
+          # S3 credentials — used by all providers (e84 uses AWS S3, cdse/ed use custom endpoint)
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          # ed provider — must supply catalog URL
+          CATALOG_URL: ${{ secrets.CATALOG_URL }}
+          STAC_PROVIDER: ${{ vars.STAC_PROVIDER }}
+          METHANE_E2E_BBOX: ${{ vars.METHANE_E2E_BBOX }}
+          METHANE_E2E_L1C_ID: ${{ vars.METHANE_E2E_L1C_ID }}
+          METHANE_E2E_L2A_ID: ${{ vars.METHANE_E2E_L2A_ID }}
+          METHANE_E2E_COLLECTION: ${{ vars.METHANE_E2E_COLLECTION }}
+        run: pytest -m e2e_real -v

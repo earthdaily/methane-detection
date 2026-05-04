@@ -181,3 +181,68 @@ def patch_aws_session(mocker):
     """Neutralize AWSSession + boto3 so no real AWS calls are attempted."""
     mocker.patch("process_item.boto3.Session", return_value=mocker.MagicMock())
     mocker.patch("process_item.AWSSession", return_value=None)
+
+
+# ---------------------------------------------------------------------------
+# Real E2E provider fixture
+# ---------------------------------------------------------------------------
+
+import os as _os
+
+_PROVIDER_MATRIX = [
+    pytest.param(
+        {
+            "name": "e84",
+            # catalog_url has a hardcoded default in providers.py; only S3 creds needed
+            "required_vars": ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"),
+            "env_overrides": {},
+        },
+        id="e84",
+        marks=pytest.mark.e2e_real,
+    ),
+    pytest.param(
+        {
+            "name": "cdse",
+            "required_vars": ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"),
+            # Drop CATALOG_URL so the provider default kicks in
+            "env_overrides": {"CATALOG_URL": None},
+        },
+        id="cdse",
+        marks=pytest.mark.e2e_real,
+    ),
+    pytest.param(
+        {
+            "name": "ed",
+            # catalog_url="" in providers.py — must be supplied via CATALOG_URL env var
+            "required_vars": ("CATALOG_URL", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"),
+            # No env_overrides: CATALOG_URL is intentionally read from env
+            "env_overrides": {},
+        },
+        id="ed",
+        marks=pytest.mark.e2e_real,
+    ),
+]
+
+
+@pytest.fixture(params=_PROVIDER_MATRIX)
+def provider_config(request):
+    """
+    Parametrized fixture that yields one provider dict per real-E2E run.
+
+    Each dict has:
+      name           – provider name string passed to --stac-provider
+      required_vars  – env vars that must be present; test is skipped if any are missing
+      env_overrides  – dict merged into os.environ for subprocess calls
+                       (None value means delete the key)
+
+    Adding a new provider (e.g. Microsoft Planetary Computer) = one new
+    pytest.param entry in _PROVIDER_MATRIX above, nothing else.
+    """
+    cfg = request.param
+    missing = [v for v in cfg["required_vars"] if not _os.getenv(v)]
+    if missing:
+        pytest.skip(
+            f"[{cfg['name']}] real E2E skipped — missing env vars: {', '.join(missing)}. "
+            "See tests/e2e/README.md for setup."
+        )
+    return cfg

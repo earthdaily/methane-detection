@@ -40,9 +40,14 @@ $graph:
         default: 10
         doc: Optional maximum number of L1C scenes to process.
       download_bands_list:
-        type: string
-        default: '["B11.jp2", "B12.jp2"]'
-        doc: JSON list of band asset keys to process.
+        type: ["null", string]
+        default: null
+        doc: |
+          JSON list of band asset keys to process. When unset, the per-provider
+          default in providers.py is used:
+            e84  -> ["swir16","swir22"]
+            cdse -> ["B11","B12"]
+            ed   -> ["B11.jp2","B12.jp2"]
       skip_viz:
         type: boolean
         default: false
@@ -56,8 +61,15 @@ $graph:
         default: false
         doc: Emit single-resolution GeoTIFF outputs.
       catalog_url:
+        type: ["null", string]
+        default: null
+        doc: STAC API endpoint. Defaults to provider-appropriate URL when not set.
+      stac_provider:
         type: string
-        doc: STAC API endpoint used to search and resolve Sentinel-2 items.
+        default: e84
+        doc: |
+          STAC backend provider. Use "e84" for Element84 Earth Search (AWS S3),
+          "cdse" for Copernicus Data Space Ecosystem, or "ed" for EDA.
 
     outputs:
       stac_catalog:
@@ -83,6 +95,7 @@ $graph:
           skip_colorized: skip_colorized
           skip_overviews: skip_overviews
           catalog_url: catalog_url
+          stac_provider: stac_provider
         out: [stac_catalog]
 
   - class: CommandLineTool
@@ -93,7 +106,11 @@ $graph:
       InlineJavascriptRequirement: {}
       EnvVarRequirement:
         envDef:
-          CATALOG_URL: $(inputs.catalog_url)
+          CATALOG_URL: $(inputs.catalog_url || "")
+          # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY carry credentials for ALL
+          # S3-compatible providers (e84, ed AWS S3 and CDSE eodata). They must
+          # be supplied to the runner via the EOAP secret-injection mechanism
+          # configured outside this CWL.
       NetworkAccess:
         networkAccess: true
       ResourceRequirement:
@@ -110,11 +127,11 @@ $graph:
       start_datetime:
         type: string
         inputBinding:
-          prefix: --start_datetime
+          prefix: --start-datetime
       end_datetime:
         type: string
         inputBinding:
-          prefix: --end_datetime
+          prefix: --end-datetime
       collection1:
         type: string
         inputBinding:
@@ -126,15 +143,15 @@ $graph:
       cloud_cover:
         type: ["null", double]
         inputBinding:
-          prefix: --cloud_cover
+          prefix: --cloud-cover
       limit:
         type: ["null", int]
         inputBinding:
           prefix: --limit
       download_bands_list:
-        type: string
+        type: ["null", string]
         inputBinding:
-          prefix: --download_bands_list
+          prefix: --download-bands-list
       skip_viz:
         type: boolean
         inputBinding:
@@ -148,7 +165,11 @@ $graph:
         inputBinding:
           prefix: --skip-overviews
       catalog_url:
+        type: ["null", string]
+      stac_provider:
         type: string
+        inputBinding:
+          prefix: --stac-provider
 
     outputs:
       stac_catalog:
