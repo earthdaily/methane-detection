@@ -346,7 +346,6 @@ def read_and_reproject_data(
     try:
         band_hrefs = [item.assets[band].href for band in download_bands_list]
         logger.info(f"Bands to download: {download_bands_list}")
-        logger.info(f"Band hrefs: {band_hrefs}")
     except KeyError as e:
         logger.error(f"Band not found in item assets: {e}")
         return None
