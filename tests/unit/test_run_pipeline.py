@@ -38,11 +38,11 @@ def test_pipeline_wires_search_process_catalog_and_aggregation(monkeypatch, mock
         [
             "--bbox",
             "[-3.67, 40.23, -3.61, 40.29]",
-            "--catalog_url",
+            "--catalog-url",
             "https://stac.example.com",
             "--limit",
             "1",
-            "--cloud_cover",
+            "--cloud-cover",
             "5",
             "--skip-viz",
             "--skip-colorized",
@@ -59,10 +59,11 @@ def test_pipeline_wires_search_process_catalog_and_aggregation(monkeypatch, mock
         collection="sentinel-2-l1c",
         l1c_id="S2A_L1C_TEST",
         l2a_id="S2A_L2A_TEST",
-        download_bands_list=["B11.jp2", "B12.jp2"],
+        download_bands_list=None,
         skip_viz=True,
         skip_colorized=True,
         skip_overviews=False,
+        stac_provider="e84",
     )
     catalog_mock.assert_called_once_with(["S2A_L1C_TEST"])
     aggregate_mock.assert_called_once_with(

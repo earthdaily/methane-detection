@@ -4,6 +4,9 @@ markers = [
     "integration: local GDAL/rasterio only, no network",
     "e2e_mocked: offline end-to-end with synthetic rasters + mocked STAC",
     "e2e_real: hits live STAC and requester-pays S3 (requires env vars)",
+    "e84: real E2E tests scoped to the Element84 provider",
+    "cdse: real E2E tests scoped to the CDSE provider",
+    "ed: real E2E tests scoped to the ED provider",
 ]
 addopts = "-m 'not e2e_real' --strict-markers --basetemp=./test-out"
 filterwarnings = [

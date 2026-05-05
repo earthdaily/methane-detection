@@ -342,16 +342,23 @@ class TestStacOutput:
         }
 
 
-class TestGetCatalogUrl:
-    def test_missing_env_exits(self, monkeypatch):
+class TestResolveCatalogUrl:
+    def test_missing_env_raises_for_provider_without_default(self, monkeypatch):
+        # "ed" has no hardcoded default — CATALOG_URL env var is required
+        import providers
         monkeypatch.delenv("CATALOG_URL", raising=False)
-        with pytest.raises(SystemExit) as exc:
-            pi.get_catalog_url()
-        assert exc.value.code == 1
+        with pytest.raises(RuntimeError):
+            providers.resolve_catalog_url("ed")
 
     def test_present_env_is_returned(self, monkeypatch):
+        import providers
         monkeypatch.setenv("CATALOG_URL", "https://example.com/stac")
-        assert pi.get_catalog_url() == "https://example.com/stac"
+        assert providers.resolve_catalog_url("e84") == "https://example.com/stac"
+
+    def test_falls_back_to_provider_default(self, monkeypatch):
+        import providers
+        monkeypatch.delenv("CATALOG_URL", raising=False)
+        assert providers.resolve_catalog_url("e84") == providers.PROVIDERS["e84"].catalog_url
 
 
 class TestEnsureOutputDirectories:

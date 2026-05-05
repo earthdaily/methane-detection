@@ -32,8 +32,7 @@ def _redirect_outputs(monkeypatch, out_dir: Path) -> None:
     monkeypatch.setattr(pi, "ASSETS_OUT", str(assets))
 
 
-@pytest.fixture
-def mocked_pipeline(
+def _build_mocked_pipeline(
     tmp_path: Path,
     monkeypatch,
     synthetic_l1c_band,
@@ -41,12 +40,12 @@ def mocked_pipeline(
     synthetic_l2a_visual: Path,
     make_item,
     patch_stac_client,
-    patch_aws_session,
-):
+    stac_provider: str = "e84",
+) -> dict:
     """
     Wire up a self-contained run: synthetic L1C + L2A rasters, a fake
     STAC catalog, neutralized AWS session, and output dirs redirected
-    to tmp_path.
+    to tmp_path. Band asset key names follow the given provider convention.
     """
     out_dir = tmp_path / "out"
     _redirect_outputs(monkeypatch, out_dir)
@@ -57,22 +56,30 @@ def mocked_pipeline(
 
     l1c_id = "S2A_L1C_MOCK_001"
     l2a_id = "S2A_L2A_MOCK_001"
-    # Positioned so bbox + its doubled expansion both fit inside the
-    # synthetic raster WGS84 footprint defined in conftest.
     bbox = [-3.83, 40.32, -3.77, 40.38]
+
+    if stac_provider == "cdse":
+        l1c_assets = {"B11": str(b11), "B12": str(b12)}
+        l2a_assets = {"SCL_20m": str(synthetic_l2a_scl), "TCI_10m": str(synthetic_l2a_visual)}
+    elif stac_provider == "ed":
+        l1c_assets = {"B11.jp2": str(b11), "B12.jp2": str(b12)}
+        l2a_assets = {"SCL_20m": str(synthetic_l2a_scl), "TCI_10m": str(synthetic_l2a_visual)}
+    else:  # e84
+        l1c_assets = {"swir16": str(b11), "swir22": str(b12)}
+        l2a_assets = {"scl": str(synthetic_l2a_scl), "visual": str(synthetic_l2a_visual)}
 
     l1c_item = make_item(
         item_id=l1c_id,
         platform="sentinel-2a",
         datetime_iso="2023-01-06T11:20:00Z",
-        assets={"B11.jp2": str(b11), "B12.jp2": str(b12)},
+        assets=l1c_assets,
         bbox=bbox,
     )
     l2a_item = make_item(
         item_id=l2a_id,
         platform="sentinel-2a",
         datetime_iso="2023-01-06T11:20:00Z",
-        assets={"scl": str(synthetic_l2a_scl), "visual": str(synthetic_l2a_visual)},
+        assets=l2a_assets,
         bbox=bbox,
     )
     patch_stac_client([l1c_item, l2a_item])
@@ -84,7 +91,65 @@ def mocked_pipeline(
         "l1c_id": l1c_id,
         "l2a_id": l2a_id,
         "bbox": bbox,
+        "stac_provider": stac_provider,
     }
+
+
+@pytest.fixture
+def mocked_pipeline(
+    tmp_path: Path,
+    monkeypatch,
+    synthetic_l1c_band,
+    synthetic_l2a_scl: Path,
+    synthetic_l2a_visual: Path,
+    make_item,
+    patch_stac_client,
+    patch_aws_session,
+):
+    return _build_mocked_pipeline(
+        tmp_path, monkeypatch, synthetic_l1c_band,
+        synthetic_l2a_scl, synthetic_l2a_visual, make_item,
+        patch_stac_client, stac_provider="e84",
+    )
+
+
+@pytest.fixture
+def mocked_pipeline_cdse(
+    tmp_path: Path,
+    monkeypatch,
+    synthetic_l1c_band,
+    synthetic_l2a_scl: Path,
+    synthetic_l2a_visual: Path,
+    make_item,
+    patch_stac_client,
+    patch_aws_session,
+):
+    return _build_mocked_pipeline(
+        tmp_path, monkeypatch, synthetic_l1c_band,
+        synthetic_l2a_scl, synthetic_l2a_visual, make_item,
+        patch_stac_client, stac_provider="cdse",
+    )
+
+
+@pytest.fixture
+def mocked_pipeline_ed(
+    tmp_path: Path,
+    monkeypatch,
+    synthetic_l1c_band,
+    synthetic_l2a_scl: Path,
+    synthetic_l2a_visual: Path,
+    make_item,
+    patch_stac_client,
+    patch_aws_session,
+):
+    # The "ed" provider has no hardcoded catalog URL — supply a placeholder via
+    # CATALOG_URL. The URL is never actually contacted because PyStacClient is
+    # patched.
+    return _build_mocked_pipeline(
+        tmp_path, monkeypatch, synthetic_l1c_band,
+        synthetic_l2a_scl, synthetic_l2a_visual, make_item,
+        patch_stac_client, stac_provider="ed",
+    )
 
 
 def test_full_pipeline_l1c_only(mocked_pipeline):
@@ -100,6 +165,8 @@ def test_full_pipeline_l1c_only(mocked_pipeline):
             "sentinel-2-l1c",
             "--l1c-id",
             info["l1c_id"],
+            "--stac-provider",
+            info["stac_provider"],
             "--skip-viz",
             "--skip-colorized",
         ],
@@ -147,6 +214,8 @@ def test_full_pipeline_with_l2a_cloud_mask(mocked_pipeline):
             info["l1c_id"],
             "--l2a-id",
             info["l2a_id"],
+            "--stac-provider",
+            info["stac_provider"],
             "--skip-viz",
             "--skip-colorized",
         ],
@@ -194,7 +263,7 @@ def test_aggregate_across_multiple_items(
             item_id=item_id,
             platform="sentinel-2a",
             datetime_iso=dt_iso,
-            assets={"B11.jp2": str(b11), "B12.jp2": str(b12)},
+            assets={"swir16": str(b11), "swir22": str(b12)},
             bbox=bbox,
         )
         patch_stac_client([item])
@@ -208,6 +277,8 @@ def test_aggregate_across_multiple_items(
                 "sentinel-2-l1c",
                 "--l1c-id",
                 item_id,
+                "--stac-provider",
+                "e84",
                 "--skip-viz",
                 "--skip-colorized",
             ],
@@ -238,3 +309,119 @@ def test_aggregate_across_multiple_items(
         for key in ("min", "q1", "median", "q3", "max", "mean"):
             assert isinstance(rec[key], (int, float))
             assert np.isfinite(rec[key])
+
+
+def test_full_pipeline_cdse_provider(mocked_pipeline_cdse):
+    """Smoke: CDSE provider uses B11/B12 asset keys and CQL2 filter path."""
+    info = mocked_pipeline_cdse
+    runner = CliRunner()
+    result = runner.invoke(
+        pi.main,
+        [
+            "--bbox",
+            json.dumps(info["bbox"]),
+            "--collection",
+            "sentinel-2-l1c",
+            "--l1c-id",
+            info["l1c_id"],
+            "--stac-provider",
+            "cdse",
+            "--skip-viz",
+            "--skip-colorized",
+        ],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+
+    assets = info["assets_dir"]
+    assert (assets / f"{info['l1c_id']}_methane_enhancement.tif").exists()
+    assert (assets / f"{info['l1c_id']}_time_signal.json").exists()
+
+
+def test_full_pipeline_cdse_with_l2a(mocked_pipeline_cdse):
+    """CDSE provider with L2A cloud masking uses SCL_20m and TCI_10m keys."""
+    info = mocked_pipeline_cdse
+    runner = CliRunner()
+    result = runner.invoke(
+        pi.main,
+        [
+            "--bbox",
+            json.dumps(info["bbox"]),
+            "--collection",
+            "sentinel-2-l1c",
+            "--l1c-id",
+            info["l1c_id"],
+            "--l2a-id",
+            info["l2a_id"],
+            "--stac-provider",
+            "cdse",
+            "--skip-viz",
+            "--skip-colorized",
+        ],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+
+    rgb_path = info["assets_dir"] / f"{info['l2a_id']}_rgb_visual.tif"
+    assert rgb_path.exists()
+    with rasterio.open(rgb_path) as ds:
+        assert ds.count == 3
+        assert ds.dtypes == ("uint8", "uint8", "uint8")
+
+
+def test_full_pipeline_ed_provider(mocked_pipeline_ed):
+    """ED provider uses B11.jp2/B12.jp2 asset keys; CATALOG_URL is supplied via env."""
+    info = mocked_pipeline_ed
+    runner = CliRunner()
+    result = runner.invoke(
+        pi.main,
+        [
+            "--bbox",
+            json.dumps(info["bbox"]),
+            "--collection",
+            "sentinel-2-l1c",
+            "--l1c-id",
+            info["l1c_id"],
+            "--stac-provider",
+            "ed",
+            "--skip-viz",
+            "--skip-colorized",
+        ],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+
+    assets = info["assets_dir"]
+    assert (assets / f"{info['l1c_id']}_methane_enhancement.tif").exists()
+    assert (assets / f"{info['l1c_id']}_time_signal.json").exists()
+
+
+def test_full_pipeline_ed_with_l2a(mocked_pipeline_ed):
+    """ED provider with L2A cloud masking uses SCL_20m and TCI_10m keys."""
+    info = mocked_pipeline_ed
+    runner = CliRunner()
+    result = runner.invoke(
+        pi.main,
+        [
+            "--bbox",
+            json.dumps(info["bbox"]),
+            "--collection",
+            "sentinel-2-l1c",
+            "--l1c-id",
+            info["l1c_id"],
+            "--l2a-id",
+            info["l2a_id"],
+            "--stac-provider",
+            "ed",
+            "--skip-viz",
+            "--skip-colorized",
+        ],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+
+    rgb_path = info["assets_dir"] / f"{info['l2a_id']}_rgb_visual.tif"
+    assert rgb_path.exists()
+    with rasterio.open(rgb_path) as ds:
+        assert ds.count == 3
+        assert ds.dtypes == ("uint8", "uint8", "uint8")

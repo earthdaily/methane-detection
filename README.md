@@ -1,129 +1,145 @@
 # Methane detection (Sentinel-2 STAC pipeline)
 
-Python CLIs that search a STAC catalog for Sentinel-2 scenes, run a matched-filter methane enhancement on each L1C item, optionally aggregate per-scene time signals, and write artifacts under `out/`. The tools are packaged in a Docker image for workflows (for example Argo) or local runs.
+Python CLIs that search a STAC catalog for Sentinel-2 scenes, run a matched-filter methane enhancement on each L1C item, optionally aggregate per-scene time signals, and write artifacts under `out/`. The tools are packaged in a Docker image for workflows (e.g. Argo) or local runs.
 
 ## What is in this repo
 
 | File | Role |
 |------|------|
 | `stac_search.py` | Queries the catalog for L1C (and paired L2A) items; prints a **JSON array** to **stdout** (logs go to stderr). |
-| `process_item.py` | Processes **one** L1C item: reads bands from cloud assets (AWS requester-pays), applies L2A cloud masking when paired, runs the methane matched filter, writes GeoTIFFs/PNGs/JSON under `out/`. |
+| `process_item.py` | Processes **one** L1C item: reads bands from cloud storage, applies L2A cloud masking when paired, runs the methane matched filter, writes GeoTIFFs/PNGs/JSON under `out/`. |
 | `aggregate_signals.py` | Scans `out/assets` for `*_time_signal.json` and writes `out/signals/items_time_signal.json` with per-datetime summary stats. |
-| `run_pipeline.py` | Runs the complete flow: STAC search, per-item processing, and signal aggregation. |
+| `run_pipeline.py` | Runs the complete flow: STAC search → per-item processing → signal aggregation. |
+| `providers.py` | Single source of truth for all provider config (catalog URL, band keys, S3 endpoint, filter style). Add a new provider here — nothing else needs to change. |
 | `app-package.cwl` | EOAP/CWL Workflow package for deploying the complete flow as an OGC API Processes-style application. |
 | `Dockerfile` | Python 3.12 image with GDAL/rasterio system deps and pinned deps from `requirements.txt`. |
 | `requirements.txt` | Locked Python dependencies used by the image and for local `pip install`. |
 
-Typical flow: **search → many parallel `process_item` runs → aggregate** (aggregate only if you produced `*_time_signal.json` files).
+Typical flow: **search → many parallel `process_item` runs → aggregate**.
 
-## Prerequisites
+---
 
-- **Docker** (for the image workflow), or Python 3.12+ with GDAL if you run scripts on the host.
-- **`CATALOG_URL`**: base URL of a STAC API that exposes Sentinel-2 L1C/L2A collections compatible with this code (same collection IDs and asset layout you configure).
-- **AWS credentials** for `process_item.py`: Sentinel-2 on AWS is accessed with **requester pays** (`AWSSession(..., requester_pays=True)` in code). Configure credentials the usual way (`~/.aws/credentials`, environment variables, or IAM role in Kubernetes).
+## Supported STAC providers
 
-## Build the Docker image
+Pass `--stac-provider` to any script. The default is `e84`.
 
-From the repository root (where the `Dockerfile` lives):
+| Provider | `--stac-provider` | Catalog URL | S3 backend | Filter style |
+|---|---|---|---|---|
+| Element84 Earth Search | `e84` | `https://earth-search.aws.element84.com/v1` (hardcoded) | AWS S3 (requester-pays) | STAC Query extension |
+| Copernicus Data Space | `cdse` | `https://stac.dataspace.copernicus.eu/v1/` (hardcoded) | CDSE S3 | CQL2 |
+| ED | `ed` | Must be set via `CATALOG_URL` env var | AWS S3 (requester-pays) | CQL2 |
+
+Provider config lives in `providers.py`. Adding a new provider (e.g. Microsoft Planetary Computer) = one new dict entry there, nothing else.
+
+---
+
+## Credentials setup
+
+### e84 — Element84
 
 ```bash
-docker build -t methane-detection:latest .
+export AWS_ACCESS_KEY_ID="..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_REGION="us-west-2"          # optional, defaults to us-west-2
 ```
 
-The image installs `requirements.txt`, then copies `stac_search.py`, `process_item.py`, `aggregate_signals.py`, and `run_pipeline.py` into `/app`. There is no default `CMD`; you invoke the scripts explicitly.
+### cdse — Copernicus Data Space
 
-To mount outputs and pass config:
+Get keys from: https://eodata-s3keysmanager.dataspace.copernicus.eu
 
 ```bash
-docker run --rm \
-  -e CATALOG_URL="https://your-stac-api.example.com/" \
-  -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
-  -v "$(pwd)/out:/app/out" \
-  methane-detection:latest \
-  python /app/stac_search.py --help
+export AWS_ACCESS_KEY_ID="..."
+export AWS_SECRET_ACCESS_KEY="..."
 ```
 
-Adjust env vars and volume mount paths as needed. The `.dockerignore` file excludes local `out/`, virtualenvs, secrets, and other non-runtime paths from the build context.
+### ed — EDA
 
-## Run the scripts locally (without Docker)
+Same AWS S3 backend as `e84` (requester-pays, `us-west-2`). Only difference is the catalog URL, which must be supplied:
+
+```bash
+export CATALOG_URL="https://ed-stac-endpoint/v1/stac"
+export AWS_ACCESS_KEY_ID="..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_REGION="us-west-2"
+```
+
+---
+
+## Run locally (without Docker)
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-export CATALOG_URL="https://your-stac-api.example.com/"
-python stac_search.py --help
-python process_item.py --help
-python aggregate_signals.py --help
-python run_pipeline.py --help
 ```
-
-You still need GDAL/rasterio-compatible system libraries on the host (the Dockerfile shows the Debian packages used in the container).
 
 ### `stac_search.py`
 
-Searches **primary** (`--collection1`, default `sentinel-2-l1c`) and **secondary** (`--collection2`, default `sentinel-2-l2a`) collections over a bbox and time range, deduplicates near-duplicate scenes, and pairs L2A ids where overlap and acquisition time match. **Stdout** is a JSON list like:
+Searches L1C and paired L2A collections over a bbox and time range, deduplicates near-duplicate scenes, and pairs L2A ids where overlap and acquisition time match.
 
-`[{"sentinel-2-l1c": "<id>", "sentinel-2-l2a": "<id or null>"}, ...]`
-
-**Catalog URL**: set `CATALOG_URL` or pass `--catalog_url`.
-
-Useful options (see `--help` for all):
-
-- `--bbox` — JSON list `[west, south, east, north]` (default bbox is built-in for demos).
-- `--start_datetime` / `--end_datetime` — ISO 8601 range.
-- `--cloud_cover` — max `eo:cloud_cover` (requires STAC Query extension support on the server).
-- `--limit` — max L1C items; L2A search uses a higher internal limit for pairing.
-
-Example:
+Stdout is a JSON list: `[{"sentinel-2-l1c": "<id>", "sentinel-2-l2a": "<id or null>"}, ...]`
 
 ```bash
-export CATALOG_URL="https://your-stac-api.example.com/"
 python stac_search.py \
   --bbox '[-3.67, 40.23, -3.61, 40.29]' \
-  --start_datetime 2023-01-01T00:00:00Z \
-  --end_datetime 2023-01-24T23:59:59Z \
+  --start-datetime 2025-01-01T00:00:00Z \
+  --end-datetime   2025-01-31T23:59:59Z \
+  --cloud-cover 10 \
   --limit 5 \
-  > items.json
+  --stac-provider e84
+```
+
+For `cdse` or `ed`, omit `CATALOG_URL` (cdse) or set it (ed) and swap the provider flag:
+
+```bash
+# cdse
+python stac_search.py --stac-provider cdse --bbox '...' --start-datetime ... --end-datetime ...
+
+# ed
+export CATALOG_URL="https://your-eda-stac-endpoint/v1"
+python stac_search.py --stac-provider ed --bbox '...' --start-datetime ... --end-datetime ...
 ```
 
 ### `process_item.py`
 
-Processes a **single** L1C item. **Requires** `CATALOG_URL`. Writes under:
+Processes a **single** L1C item. Writes under `out/stac_items/` and `out/assets/`.
 
-- `out/stac_items/` — item metadata
-- `out/assets/` — rasters, plots, and per-item `*_time_signal.json` when signal processing succeeds
+Required flags:
 
-Required arguments:
+- `--bbox` — JSON `[west, south, east, north]`
+- `--collection` — STAC collection name (e.g. `sentinel-2-l1c`)
+- `--l1c-id` — L1C item id
+- `--stac-provider` — `e84` / `cdse` / `ed`
 
-- `--bbox` — JSON `[west, south, east, north]` (the pipeline expands this internally for reads).
-- `--collection` — STAC collection name for the L1C item (for example `sentinel-2-l1c`).
-- `--l1c-id` — L1C item id.
+Optional flags:
 
-Optional:
-
-- `--l2a-id` — paired L2A item for SCL-based masking and RGB (omit if none).
-- `--download_bands_list` — JSON list of asset keys (default `["B11.jp2", "B12.jp2"]`).
-- `--skip-viz` — skip matplotlib PNGs and legend.
-- `--skip-colorized` — skip colorized heatmap COG.
-- `--skip-overviews` — single-resolution GeoTIFF outputs.
-- **`METHANE_TARGET_RES`** — JSON array of two positive floats, WGS84 degrees per pixel, e.g. `[0.00018, 0.00018]` (default matches the previous built-in resolution). Ignored when using `--auto-res` for the chosen grid resolution (snap/origin logic unchanged).
-- **`--auto-res`** — derive WGS84 pixel size from the first L1C band (`rasterio.open` once), then run the same snapped `compute_target_grid` as fixed mode. Default off preserves prior behavior when `METHANE_TARGET_RES` is unset.
-
-Example (after you have ids from search or elsewhere):
+- `--l2a-id` — paired L2A item for SCL-based masking and RGB output
+- `--download-bands-list` — JSON list of asset keys (provider default used if omitted)
+- `--skip-viz` — skip matplotlib PNGs
+- `--skip-colorized` — skip colorized heatmap COG
+- `--skip-overviews` — single-resolution GeoTIFF outputs
+- `--auto-res` — derive WGS84 pixel size from the first L1C band instead of using `METHANE_TARGET_RES`
 
 ```bash
-export CATALOG_URL="https://your-stac-api.example.com/"
+# e84
 python process_item.py \
   --bbox '[-3.67, 40.23, -3.61, 40.29]' \
   --collection sentinel-2-l1c \
-  --l1c-id S2A_MSIL1C_20230115T105021_N0510_R051_T30TVK_20230115T123456 \
-  --l2a-id S2A_MSIL2A_20230115T105021_N0510_R051_T30TVK_20230115T234567
+  --l1c-id S2A_MSIL1C_20250115T105021_N0510_R051_T30TVK_20250115T123456 \
+  --l2a-id S2A_MSIL2A_20250115T105021_N0510_R051_T30TVK_20250115T234567 \
+  --stac-provider e84
+
+# cdse
+python process_item.py \
+  --bbox '[-3.67, 40.23, -3.61, 40.29]' \
+  --collection sentinel-2-l1c \
+  --l1c-id S2C_MSIL1C_20250130T111341_N0511_R137_T30TVK_20250206T144330 \
+  --stac-provider cdse
 ```
 
 ### `aggregate_signals.py`
 
-After one or more `process_item` runs have written `out/assets/*_time_signal.json`, combine them:
+After one or more `process_item` runs have written `out/assets/*_time_signal.json`:
 
 ```bash
 python aggregate_signals.py \
@@ -131,47 +147,149 @@ python aggregate_signals.py \
   --signals-dir out/signals
 ```
 
-This creates `out/signals/items_time_signal.json` (or an empty structure if no matching files exist). If there are no `*_time_signal.json` files, the command still writes an empty aggregate file and logs a warning.
+Writes `out/signals/items_time_signal.json`. If no signal files exist, writes an empty aggregate and logs a warning.
 
 ### `run_pipeline.py`
 
 Runs the full search → process → aggregate flow in one command. This is the executable used by `app-package.cwl`.
 
 ```bash
-export CATALOG_URL="https://your-stac-api.example.com/"
+# e84
 python run_pipeline.py \
   --bbox '[-3.67, 40.23, -3.61, 40.29]' \
-  --start_datetime 2023-01-01T00:00:00Z \
-  --end_datetime 2023-01-24T23:59:59Z \
-  --limit 5
+  --start-datetime 2025-01-01T00:00:00Z \
+  --end-datetime   2025-01-31T23:59:59Z \
+  --limit 5 \
+  --stac-provider e84
+
+# cdse
+python run_pipeline.py \
+  --bbox '[-3.67, 40.23, -3.61, 40.29]' \
+  --start-datetime 2025-01-01T00:00:00Z \
+  --end-datetime   2025-01-31T23:59:59Z \
+  --stac-provider cdse
+
+# ed
+export CATALOG_URL="https://ed-stac-endpoint/v1/stac"
+python run_pipeline.py \
+  --bbox '[-3.67, 40.23, -3.61, 40.29]' \
+  --start-datetime 2025-01-01T00:00:00Z \
+  --end-datetime   2025-01-31T23:59:59Z \
+  --stac-provider ed
 ```
 
 ### `app-package.cwl`
 
-The EOAP package is a CWL `Workflow` that exposes the complete repository capability through `run_pipeline.py` and writes the `out/` directory as the workflow output.
-
 ```bash
 cwltool app-package.cwl \
   --bbox '[-3.67, 40.23, -3.61, 40.29]' \
-  --start_datetime 2023-01-01T00:00:00Z \
-  --end_datetime 2023-01-24T23:59:59Z \
+  --start-datetime 2025-01-01T00:00:00Z \
+  --end-datetime   2025-01-31T23:59:59Z \
   --limit 5 \
-  --catalog_url https://earth-search.aws.element84.com/v1
+  --stac-provider e84
 ```
 
-## End-to-end shell sketch
+#### Testing the CWL with a locally built image
 
-This is illustrative: parse `items.json` with `jq` or your orchestrator to fan out `process_item` per element.
+The CWL pins `dockerPull: docker.io/earthdaily/methane-detection:vX.Y.Z`, so by default cwltool fetches the published image. To validate a local build before publishing, tag your build with that exact name and disable the registry pull:
 
 ```bash
-export CATALOG_URL="https://your-stac-api.example.com/"
-python stac_search.py --limit 2 > items.json
-# For each object in items.json, run process_item.py with .["sentinel-2-l1c"], .["sentinel-2-l2a"], etc.
-python aggregate_signals.py
+docker build -t methane-detection:test .
+docker tag methane-detection:test docker.io/earthdaily/methane-detection:vX.Y.Z   # match the pin
+
+# Credentials must be exported in the calling shell; cwltool needs to be told which
+# env vars to forward into the container.
+export AWS_ACCESS_KEY_ID="..." AWS_SECRET_ACCESS_KEY="..." AWS_REGION="us-west-2"
+
+cwltool --disable-pull \
+  --preserve-environment AWS_ACCESS_KEY_ID \
+  --preserve-environment AWS_SECRET_ACCESS_KEY \
+  --preserve-environment AWS_REGION \
+  --outdir out-e84 \
+  app-package.cwl --stac-provider e84 --bbox '[-3.67, 40.23, -3.61, 40.29]' \
+    --start-datetime 2025-01-01T00:00:00Z --end-datetime 2025-01-31T23:59:59Z --limit 1
 ```
+
+For CDSE, re-export `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` with the keys from [eodata-s3keysmanager](https://eodata-s3keysmanager.dataspace.copernicus.eu) and run again with `--stac-provider cdse --outdir out-cdse`.
+
+---
+
+## Build and run with Docker
+
+```bash
+docker build -t methane-detection:latest .
+```
+
+```bash
+# e84
+docker run --rm \
+  -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_REGION \
+  -v "$(pwd)/out:/app/out" \
+  methane-detection:latest \
+  python /app/run_pipeline.py \
+    --bbox '[-3.67, 40.23, -3.61, 40.29]' \
+    --start-datetime 2025-01-01T00:00:00Z \
+    --end-datetime   2025-01-31T23:59:59Z \
+    --stac-provider e84
+
+# cdse
+docker run --rm \
+  -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY \
+  -v "$(pwd)/out:/app/out" \
+  methane-detection:latest \
+  python /app/run_pipeline.py \
+    --bbox '[-3.67, 40.23, -3.61, 40.29]' \
+    --start-datetime 2025-01-01T00:00:00Z \
+    --end-datetime   2025-01-31T23:59:59Z \
+    --stac-provider cdse
+```
+
+---
+
+## Tests
+
+### Default (no credentials needed)
+
+```bash
+pytest                    # unit + mocked e2e (default)
+pytest tests/unit         # unit only
+pytest tests/integration  # local GDAL/rasterio, no network
+pytest -m e2e_mocked      # full mocked pipeline (synthetic rasters + mocked STAC)
+```
+
+### Real E2E (hits live STAC + S3)
+
+Tests are parametrized over all three providers. Each provider auto-skips if its required env vars are missing — no red failures.
+
+```bash
+# All providers at once (skips whichever has no creds)
+pytest -m e2e_real -v
+
+# Single provider
+pytest -m e2e_real -k e84   -v
+pytest -m e2e_real -k cdse  -v
+pytest -m e2e_real -k ed    -v
+```
+
+Override test parameters:
+
+```bash
+export METHANE_E2E_BBOX='[-3.67, 40.23, -3.61, 40.29]'
+export METHANE_E2E_START='2025-01-01T00:00:00Z'
+export METHANE_E2E_END='2025-01-31T23:59:59Z'
+export METHANE_E2E_CLOUD_COVER='10'
+export METHANE_E2E_LIMIT='2'           # set low for faster runs
+```
+
+See [`tests/e2e/README.md`](tests/e2e/README.md) for full details.
+
+---
 
 ## Troubleshooting
 
-- **`CATALOG_URL` not set** — both search and process exit with an error until it is defined.
-- **Rasterio / GDAL errors in Docker** — rebuild after changing `requirements.txt`; the image pins `GDAL` and `rasterio` to versions that expect the Debian `libgdal-dev` in the Dockerfile.
-- **Empty or failed reads from AWS** — confirm AWS credentials, region, and that your account accepts **requester-pays** charges for the Sentinel-2 bucket you use.
+- **Provider skipped in real E2E** — the skip message lists the exact missing env vars.
+- **`CATALOG_URL` not set for `ed`** — `ed` has no hardcoded default; the script exits with an error until it is set.
+- **403 from S3 (e84)** — requester-pays requires valid credentials. Verify with `aws sts get-caller-identity`.
+- **403 from S3 (cdse/ed)** — check `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` are correct.
+- **Empty search results** — no items matched the AOI/date/cloud filter. Lower `--cloud-cover` or widen the date range.
+- **Rasterio / GDAL errors in Docker** — rebuild after changing `requirements.txt`.
