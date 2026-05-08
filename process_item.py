@@ -9,9 +9,7 @@ import copy
 import json
 import logging
 import os
-import random
 import sys
-import time
 from typing import Any, Optional
 
 import affine
@@ -31,6 +29,8 @@ from pystac_client import Client as PyStacClient
 from rasterio.session import AWSSession
 from scipy.ndimage import median_filter
 from shapely.geometry import box
+
+from utils import retry_transient
 
 # Configure logging
 logging.basicConfig(
@@ -58,65 +58,7 @@ TARGET_BLOCK_SIZE = 256
 METHANE_RANGE = (-2.0, 2.0)
 AVERAGED_RANGE = (-0.15, 0.15)
 IME_PERCENTILE = 95
-READ_RETRY_ATTEMPTS = max(1, int(os.getenv("METHANE_READ_RETRY_ATTEMPTS", "4")))
-READ_RETRY_BASE_DELAY = float(os.getenv("METHANE_READ_RETRY_BASE_DELAY", "5"))
-READ_RETRY_MAX_DELAY = float(os.getenv("METHANE_READ_RETRY_MAX_DELAY", "60"))
 
-
-TRANSIENT_ERROR_MARKERS = (
-    "429",
-    "500",
-    "502",
-    "503",
-    "504",
-    "connection",
-    "connection reset",
-    "connection refused",
-    "could not connect",
-    "curl error",
-    "expired token",
-    "max session",
-    "rate",
-    "rate limit",
-    "request timeout",
-    "temporarily unavailable",
-    "timeout",
-    "timed out",
-    "too many requests",
-)
-
-
-def is_transient_read_error(exc: Exception) -> bool:
-    """Return True for S3/STAC failures that are usually worth retrying."""
-    msg = str(exc).lower()
-    return any(marker in msg for marker in TRANSIENT_ERROR_MARKERS)
-
-
-def retry_transient(operation_name: str, func):
-    """Retry transient remote-read operations before letting Argo retry the pod."""
-    last_exc = None
-    for attempt in range(1, READ_RETRY_ATTEMPTS + 1):
-        try:
-            return func()
-        except Exception as exc:
-            last_exc = exc
-            if attempt >= READ_RETRY_ATTEMPTS or not is_transient_read_error(exc):
-                raise
-            delay = min(
-                READ_RETRY_MAX_DELAY,
-                READ_RETRY_BASE_DELAY * (2 ** (attempt - 1)),
-            )
-            delay += random.uniform(0, min(delay * 0.25, 5.0))
-            logger.warning(
-                "%s failed on attempt %s/%s with transient error: %s. Retrying in %.1fs",
-                operation_name,
-                attempt,
-                READ_RETRY_ATTEMPTS,
-                exc,
-                delay,
-            )
-            time.sleep(delay)
-    raise last_exc
 
 def build_s3_session(stac_provider: str) -> AWSSession:
     """Create an S3 session appropriate for the given STAC provider."""
