@@ -1,0 +1,247 @@
+"""
+Shared utilities for the methane-detection pipeline.
+
+Centralizes retry/backoff logic used by both the STAC search step and the
+per-item processing step so transient CDSE/S3/STAC failures are absorbed
+inside the running container before Argo has to restart the whole pod.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import random
+import re
+import time
+from typing import Callable, TypeVar
+
+logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
+
+
+# Fallback markers for opaque upstream errors.
+TRANSIENT_ERROR_MARKERS: tuple[str, ...] = (
+    "429",
+    "500",
+    "502",
+    "503",
+    "504",
+    "connection",
+    "connection reset",
+    "connection refused",
+    "could not connect",
+    "curl error",
+    "expired token",
+    "max session",
+    "rate",
+    "rate limit",
+    "request timeout",
+    "temporarily unavailable",
+    "timeout",
+    "timed out",
+    "too many requests",
+)
+
+
+# botocore errors that are safe to retry.
+_TRANSIENT_CLIENT_ERROR_CODES: frozenset[str] = frozenset({
+    "Throttling",
+    "ThrottlingException",
+    "RequestTimeout",
+    "RequestTimeTooSkewed",
+    "SlowDown",
+    "ServiceUnavailable",
+    "InternalError",
+    "InternalFailure",
+    "PriorRequestNotComplete",
+})
+_TRANSIENT_HTTP_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
+
+# botocore errors that should fail fast.
+_NON_TRANSIENT_CLIENT_ERROR_CODES: frozenset[str] = frozenset({
+    "AccessDenied",
+    "NoSuchBucket",
+    "NoSuchKey",
+    "InvalidRequest",
+    "InvalidBucketName",
+    "AuthorizationHeaderMalformed",
+    "SignatureDoesNotMatch",
+})
+
+
+def _build_transient_types() -> tuple[type, ...]:
+    """Collect known-transient exception classes from optional deps at import time."""
+    types: list[type] = []
+    try:
+        from requests.exceptions import (
+            ChunkedEncodingError, ConnectionError as RequestsConnectionError, Timeout,
+        )
+        types.extend([RequestsConnectionError, Timeout, ChunkedEncodingError])
+    except ImportError:
+        pass
+    try:
+        from urllib3.exceptions import (
+            NewConnectionError, ProtocolError, ReadTimeoutError as Urllib3ReadTimeout,
+        )
+        types.extend([ProtocolError, Urllib3ReadTimeout, NewConnectionError])
+    except ImportError:
+        pass
+    try:
+        from botocore.exceptions import (
+            ConnectionClosedError, ConnectTimeoutError,
+            EndpointConnectionError, ReadTimeoutError as BotoReadTimeout,
+        )
+        types.extend([
+            EndpointConnectionError, BotoReadTimeout,
+            ConnectTimeoutError, ConnectionClosedError,
+        ])
+    except ImportError:
+        pass
+    return tuple(types)
+
+
+_TRANSIENT_EXCEPTION_TYPES: tuple[type, ...] = _build_transient_types()
+
+try:
+    from botocore.exceptions import ClientError as _BotoClientError
+except ImportError:
+    _BotoClientError = None  # type: ignore[assignment,misc]
+
+
+# Credential-bearing query parameters to redact from retry logs.
+_SENSITIVE_QUERY_PARAMS: tuple[str, ...] = (
+    "X-Amz-Signature",
+    "X-Amz-Credential",
+    "X-Amz-Security-Token",
+    "Signature",
+    "signature",
+    "sig",
+    "token",
+    "access_token",
+    "AWSAccessKeyId",
+)
+_QUERY_REDACT_RE = re.compile(
+    r"([?&])(" + "|".join(re.escape(p) for p in _SENSITIVE_QUERY_PARAMS) + r")="
+    r"[^&\s\"'<>]+",
+    re.IGNORECASE,
+)
+_BEARER_REDACT_RE = re.compile(
+    r"(Bearer\s+)[A-Za-z0-9._\-+/=]+", re.IGNORECASE
+)
+
+
+def _redact_sensitive(text: str) -> str:
+    """Strip signed URL credentials and bearer tokens before logging."""
+    redacted = _QUERY_REDACT_RE.sub(r"\1\2=REDACTED", text)
+    return _BEARER_REDACT_RE.sub(r"\1REDACTED", redacted)
+
+
+def _matches_transient_marker(msg_lower: str) -> bool:
+    return any(
+        re.search(r"\b" + re.escape(m) + r"\b", msg_lower)
+        for m in TRANSIENT_ERROR_MARKERS
+    )
+
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# Retry defaults can be tuned from workflow environment variables.
+DEFAULT_RETRY_ATTEMPTS = _env_int("METHANE_READ_RETRY_ATTEMPTS", 4)
+DEFAULT_RETRY_BASE_DELAY = _env_float("METHANE_READ_RETRY_BASE_DELAY", 5.0)
+DEFAULT_RETRY_MAX_DELAY = _env_float("METHANE_READ_RETRY_MAX_DELAY", 60.0)
+
+
+def is_transient_read_error(exc: Exception) -> bool:
+    """Return True for S3/STAC failures that are usually worth retrying.
+
+    Classification order (first match wins):
+      1. Known-transient exception types from requests/urllib3/botocore.
+      2. botocore ClientError: explicit retry/no-retry by code or HTTP status.
+      3. Word-boundary substring fallback for opaque upstream errors.
+    """
+    if isinstance(exc, _TRANSIENT_EXCEPTION_TYPES):
+        return True
+
+    if _BotoClientError is not None and isinstance(exc, _BotoClientError):
+        response = getattr(exc, "response", None) or {}
+        error_code = (response.get("Error") or {}).get("Code", "")
+        http_status = (response.get("ResponseMetadata") or {}).get("HTTPStatusCode")
+        if error_code in _TRANSIENT_CLIENT_ERROR_CODES:
+            return True
+        if isinstance(http_status, int) and http_status in _TRANSIENT_HTTP_STATUSES:
+            return True
+        if error_code in _NON_TRANSIENT_CLIENT_ERROR_CODES:
+            return False
+        # Unknown ClientError code — fall through to substring fallback below.
+
+    return _matches_transient_marker(str(exc).lower())
+
+
+def retry_transient(
+    operation_name: str,
+    func: Callable[[], T],
+    *,
+    attempts: int | None = None,
+    base_delay: float | None = None,
+    max_delay: float | None = None,
+    log: logging.Logger | None = None,
+) -> T:
+    """Retry a remote-read callable with jittered exponential backoff.
+
+    Re-raises immediately on errors that don't look transient so genuine
+    failures surface without delay.
+    """
+    attempts = attempts if attempts is not None else DEFAULT_RETRY_ATTEMPTS
+    base_delay = base_delay if base_delay is not None else DEFAULT_RETRY_BASE_DELAY
+    max_delay = max_delay if max_delay is not None else DEFAULT_RETRY_MAX_DELAY
+    log = log or logger
+
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return func()
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= attempts or not is_transient_read_error(exc):
+                raise
+            delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
+            delay += random.uniform(0, min(delay * 0.25, 5.0))
+            log.warning(
+                "%s failed on attempt %s/%s with transient error: %s. Retrying in %.1fs",
+                operation_name,
+                attempt,
+                attempts,
+                _redact_sensitive(str(exc)),
+                delay,
+            )
+            time.sleep(delay)
+    # Defensive fallback; the loop exits through return or raise in normal use.
+    if last_exc is None:
+        raise RuntimeError("retry_transient exhausted attempts with no recorded exception")
+    raise last_exc
+
+
+def write_empty_flag(path: str | None, is_empty: bool) -> None:
+    """Write 'true'/'false' to a sidecar file for an Argo output parameter.
+
+    The flag is advisory, so write failures are logged but do not fail the step.
+    """
+    if not path:
+        return
+    try:
+        with open(path, "w") as f:
+            f.write("true" if is_empty else "false")
+    except OSError as exc:
+        logger.warning("Failed to write empty-flag sidecar to %s: %s", path, exc)

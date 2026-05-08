@@ -16,6 +16,7 @@ from pystac_client import Client as PyStacClient
 from pystac_client.exceptions import APIError
 
 import providers
+from utils import retry_transient, write_empty_flag
 
 # Configure logging to stderr so stdout is clean for JSON output
 logging.basicConfig(
@@ -169,8 +170,6 @@ def search_stac(
     if limit is not None:
         logger.info(f"Limit (max_items): {limit}")
 
-    client = PyStacClient.open(catalog_url)
-
     datetime_range = f"{start_datetime}/{end_datetime}"
 
     search_kw: dict = {
@@ -190,9 +189,14 @@ def search_stac(
     if limit is not None:
         search_kw["max_items"] = limit
 
-    results = client.search(**search_kw)
+    # Keep client creation inside the retry so transient pagination failures
+    # restart from a clean STAC request.
+    def _do_search() -> list[pystac.Item]:
+        client = PyStacClient.open(catalog_url)
+        results = client.search(**search_kw)
+        return results.item_collection().items
 
-    items = results.item_collection().items
+    items = retry_transient(f"STAC search ({collection})", _do_search, log=logger)
     logger.info(f"Found {len(items)} items")
 
     return items
@@ -273,6 +277,15 @@ def search_stac(
     show_default=True,
     help="STAC backend provider. 'e84' uses the Query extension; 'cdse'/'ed' use CQL2 filters.",
 )
+@click.option(
+    "--empty-flag-path",
+    "empty_flag_path",
+    default=None,
+    help="Optional path; if set, writes 'true'/'false' indicating whether the "
+         "primary (L1C) search returned zero items after deduplication. Used by "
+         "the Argo workflow to short-circuit downstream steps when AOI/TOI "
+         "yields no scenes.",
+)
 def main(
     bbox: list[float],
     start_datetime: str,
@@ -284,6 +297,7 @@ def main(
     cloud_cover: float | None,
     limit: int | None,
     stac_provider: str,
+    empty_flag_path: str | None,
 ):
     """
     Search STAC catalog and output item IDs as JSON array to stdout.
@@ -315,6 +329,17 @@ def main(
 
         l1c_items = deduplicate_items(l1c_items)
 
+        # Only write the flag after a successful search.
+        write_empty_flag(empty_flag_path, is_empty=len(l1c_items) == 0)
+
+        if len(l1c_items) == 0:
+            logger.warning(
+                "No %s items found for bbox=%s datetime=%s..%s; emitting empty result list.",
+                primary_collection, bbox, start_datetime, end_datetime,
+            )
+            print(json.dumps([]))
+            return
+
         l2a_limit = get_l2a_pairing_limit(limit)
         l2a_items = search_stac(
             bbox=bbox,
@@ -340,4 +365,3 @@ def main(
 
 if __name__ == "__main__":
     main()
-

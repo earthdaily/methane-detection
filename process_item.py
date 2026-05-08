@@ -30,6 +30,8 @@ from rasterio.session import AWSSession
 from scipy.ndimage import median_filter
 from shapely.geometry import box
 
+from utils import retry_transient
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -56,6 +58,7 @@ TARGET_BLOCK_SIZE = 256
 METHANE_RANGE = (-2.0, 2.0)
 AVERAGED_RANGE = (-0.15, 0.15)
 IME_PERCENTILE = 95
+
 
 def build_s3_session(stac_provider: str) -> AWSSession:
     """Create an S3 session appropriate for the given STAC provider."""
@@ -312,14 +315,14 @@ def read_and_reproject_data(
     """
     logger.info(f"Searching for item: {item_id} in collection: {collection}")
 
-    client = PyStacClient.open(catalog_url)
-    results = client.search(ids=[item_id], collections=[collection])
+    def fetch_items():
+        client = PyStacClient.open(catalog_url)
+        results = client.search(ids=[item_id], collections=[collection])
+        if results is None:
+            return []
+        return results.item_collection().items
 
-    if results is None:
-        logger.error("No results found for the given search")
-        return None
-
-    items = results.item_collection().items
+    items = retry_transient(f"STAC lookup for {item_id}", fetch_items)
     if len(items) == 0:
         logger.error(f"No item found with ID: {item_id}")
         return None
@@ -363,24 +366,30 @@ def read_and_reproject_data(
 
         else:
             # Calculate target transform based on first band
-            with rasterio.open(band_hrefs[0]) as src:
-                dst_tfm, width, height = rasterio.warp.calculate_default_transform(
-                    src.crs,
-                    rasterio.crs.CRS.from_epsg(4326),
-                    src.width,
-                    src.height,
-                    *src.bounds,
-                )
+            def calculate_target_transform():
+                with rasterio.open(band_hrefs[0]) as src:
+                    src_tfm, src_width, src_height = rasterio.warp.calculate_default_transform(
+                        src.crs,
+                        rasterio.crs.CRS.from_epsg(4326),
+                        src.width,
+                        src.height,
+                        *src.bounds,
+                    )
 
-                # Recalculate for target bbox with same resolution
-                dst_tfm, width, height = rasterio.warp.calculate_default_transform(
-                    rasterio.crs.CRS.from_epsg(4326),
-                    rasterio.crs.CRS.from_epsg(4326),
-                    width,
-                    height,
-                    *bbox,
-                    resolution=(abs(dst_tfm[0]), abs(dst_tfm[4])),
-                )
+                    # Recalculate for target bbox with same resolution
+                    return rasterio.warp.calculate_default_transform(
+                        rasterio.crs.CRS.from_epsg(4326),
+                        rasterio.crs.CRS.from_epsg(4326),
+                        src_width,
+                        src_height,
+                        *bbox,
+                        resolution=(abs(src_tfm[0]), abs(src_tfm[4])),
+                    )
+
+            dst_tfm, width, height = retry_transient(
+                f"target transform read for {item_id}",
+                calculate_target_transform,
+            )
 
         logger.info(f"Target dimensions: {width}x{height}")
 
@@ -400,20 +409,30 @@ def read_and_reproject_data(
         im_ind = 0
         for ii, href in enumerate(band_hrefs):
             logger.info(f"Reprojecting band {download_bands_list[ii]} ({ii+1}/{len(band_hrefs)})")
-            with rasterio.open(href) as src:
-                for kk in range(src.count):
-                    rasterio.warp.reproject(
-                        source=rasterio.band(src, kk+1),
-                        destination=out_img[im_ind],
-                        src_transform=src.transform,
-                        dst_transform=dst_tfm,
-                        src_crs=src.crs,
-                        dst_crs=rasterio.crs.CRS.from_string(TARGET_CRS),
-                        src_nodata=src.nodata,
-                        dst_nodata=src.nodata,
-                        resampling=rasterio.enums.Resampling.bilinear,
-                    )
-                    im_ind += 1
+
+            def reproject_band(start_index=im_ind, band_href=href):
+                local_index = start_index
+                with rasterio.open(band_href) as src:
+                    for kk in range(src.count):
+                        rasterio.warp.reproject(
+                            source=rasterio.band(src, kk+1),
+                            destination=out_img[local_index],
+                            src_transform=src.transform,
+                            dst_transform=dst_tfm,
+                            src_crs=src.crs,
+                            dst_crs=rasterio.crs.CRS.from_string(TARGET_CRS),
+                            src_nodata=src.nodata,
+                            dst_nodata=src.nodata,
+                            resampling=rasterio.enums.Resampling.bilinear,
+                        )
+                        local_index += 1
+                    return src.count
+
+            band_count = retry_transient(
+                f"reproject band {download_bands_list[ii]} for {item_id}",
+                reproject_band,
+            )
+            im_ind += band_count
 
     logger.info("Data read and re-projected successfully")
 
