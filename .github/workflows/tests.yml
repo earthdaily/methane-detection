@@ -31,7 +31,7 @@ jobs:
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
 
-      - name: Run tests (default markers: skips e2e_real)
+      - name: "Run tests (default markers: skips e2e_real)"
         run: pytest --cov=. --cov-report=term-missing --cov-report=xml -v
 
       - name: Upload coverage artifact
@@ -71,7 +71,6 @@ jobs:
 
       - name: Run real E2E
         env:
-          CATALOG_URL: ${{ secrets.CATALOG_URL }}
           # S3 credentials — used by all providers (e84 uses AWS S3, cdse/ed use custom endpoint)
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
