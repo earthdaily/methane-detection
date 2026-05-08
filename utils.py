@@ -19,12 +19,7 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 
-# Word-boundary substring markers used as a fallback classifier for opaque
-# exceptions (pystac_client.APIError, plain Exception). Type-aware checks in
-# is_transient_read_error() run first; this tuple only matters when no
-# structured info is available. Word boundaries are applied at match time so
-# "rate" no longer matches "iterate"/"operate" and "500" no longer matches
-# "50000-byte limit".
+# Fallback markers for opaque upstream errors.
 TRANSIENT_ERROR_MARKERS: tuple[str, ...] = (
     "429",
     "500",
@@ -48,7 +43,7 @@ TRANSIENT_ERROR_MARKERS: tuple[str, ...] = (
 )
 
 
-# botocore ClientError codes/HTTP statuses that always warrant a retry.
+# botocore errors that are safe to retry.
 _TRANSIENT_CLIENT_ERROR_CODES: frozenset[str] = frozenset({
     "Throttling",
     "ThrottlingException",
@@ -62,10 +57,7 @@ _TRANSIENT_CLIENT_ERROR_CODES: frozenset[str] = frozenset({
 })
 _TRANSIENT_HTTP_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
 
-# botocore ClientError codes that are definitively *not* worth retrying.
-# Explicit so they short-circuit before the substring fallback can produce a
-# false positive (e.g. a 403 AccessDenied whose message happens to contain
-# "500" because a bucket name has digits).
+# botocore errors that should fail fast.
 _NON_TRANSIENT_CLIENT_ERROR_CODES: frozenset[str] = frozenset({
     "AccessDenied",
     "NoSuchBucket",
@@ -116,9 +108,7 @@ except ImportError:
     _BotoClientError = None  # type: ignore[assignment,misc]
 
 
-# Query-string parameter names whose values must never reach logs. Conservative
-# allow-list (only well-known credential names) keeps false-positive redactions
-# from mangling otherwise-readable error text.
+# Credential-bearing query parameters to redact from retry logs.
 _SENSITIVE_QUERY_PARAMS: tuple[str, ...] = (
     "X-Amz-Signature",
     "X-Amz-Credential",
@@ -141,15 +131,7 @@ _BEARER_REDACT_RE = re.compile(
 
 
 def _redact_sensitive(text: str) -> str:
-    """Strip credential-bearing query params and bearer tokens before logging.
-
-    botocore/requests/rasterio occasionally stringify the failing URL into the
-    exception message. Pre-signed S3/CDSE URLs carry X-Amz-Signature etc. that
-    are valid replay credentials until expiry, so logging them — especially in
-    a public-repo CI context — leaks shareable access. This redactor runs once
-    at log time and is intentionally narrow (only well-known param names) to
-    keep the rest of the message human-readable.
-    """
+    """Strip signed URL credentials and bearer tokens before logging."""
     redacted = _QUERY_REDACT_RE.sub(r"\1\2=REDACTED", text)
     return _BEARER_REDACT_RE.sub(r"\1REDACTED", redacted)
 
@@ -175,9 +157,7 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-# Defaults sourced from env so the workflow YAML can tune them without code
-# changes. Read once at import time — same behaviour as the previous inline
-# constants in process_item.py.
+# Retry defaults can be tuned from workflow environment variables.
 DEFAULT_RETRY_ATTEMPTS = _env_int("METHANE_READ_RETRY_ATTEMPTS", 4)
 DEFAULT_RETRY_BASE_DELAY = _env_float("METHANE_READ_RETRY_BASE_DELAY", 5.0)
 DEFAULT_RETRY_MAX_DELAY = _env_float("METHANE_READ_RETRY_MAX_DELAY", 60.0)
@@ -189,12 +169,7 @@ def is_transient_read_error(exc: Exception) -> bool:
     Classification order (first match wins):
       1. Known-transient exception types from requests/urllib3/botocore.
       2. botocore ClientError: explicit retry/no-retry by code or HTTP status.
-      3. Word-boundary substring fallback for opaque exceptions (pystac
-         APIError, plain Exception messages from upstream services).
-
-    The structured paths exist so a real `AccessDenied` ClientError whose
-    message happens to contain "500" (e.g. a bucket name) does not get
-    retried four times by mistake.
+      3. Word-boundary substring fallback for opaque upstream errors.
     """
     if isinstance(exc, _TRANSIENT_EXCEPTION_TYPES):
         return True
@@ -226,19 +201,8 @@ def retry_transient(
     """Retry a remote-read callable with jittered exponential backoff.
 
     Re-raises immediately on errors that don't look transient so genuine
-    failures (bad bbox, missing collection, auth) surface without delay.
-    Multiple pods retrying in parallel pick different jitter offsets, which
-    keeps them from hammering the upstream service at the same second.
-
-    Note: ``func`` should reconstruct any auth-bearing client/session itself
-    so an expired token retry can pick up a fresh credential. Callers that
-    capture a long-lived session in a closure will retry against the same
-    expired credential.
+    failures surface without delay.
     """
-    # TODO: review report items #4 (full jitter — current 25% jitter clusters
-    # parallel pods within ~1.25s of each retry boundary during a real outage)
-    # and #5 (cap attempts/max_delay regardless of env so a YAML typo cannot
-    # produce multi-day sleeps). Deferred — see plan file.
     attempts = attempts if attempts is not None else DEFAULT_RETRY_ATTEMPTS
     base_delay = base_delay if base_delay is not None else DEFAULT_RETRY_BASE_DELAY
     max_delay = max_delay if max_delay is not None else DEFAULT_RETRY_MAX_DELAY
@@ -263,9 +227,7 @@ def retry_transient(
                 delay,
             )
             time.sleep(delay)
-    # Loop only exits via return or raise; this is unreachable but keeps the
-    # type checker honest without relying on `assert` (stripped under -O).
-    # TODO: review report item #6 — could replace with explicit RuntimeError.
+    # Defensive fallback; the loop exits through return or raise in normal use.
     if last_exc is None:
         raise RuntimeError("retry_transient exhausted attempts with no recorded exception")
     raise last_exc
@@ -274,9 +236,7 @@ def retry_transient(
 def write_empty_flag(path: str | None, is_empty: bool) -> None:
     """Write 'true'/'false' to a sidecar file for an Argo output parameter.
 
-    No-op when ``path`` is falsy so the helper is safe to call unconditionally.
-    Failures to write are logged but not raised — the sidecar is advisory and
-    we never want to crash the producer step over a missing tmp file.
+    The flag is advisory, so write failures are logged but do not fail the step.
     """
     if not path:
         return

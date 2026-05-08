@@ -161,9 +161,6 @@ def search_stac(
     Returns:
         List of STAC items matching the search criteria
     """
-    # TODO: review report item #7 — strip userinfo (urlparse._replace(netloc=...))
-    # before logging so a future credentialed catalog URL does not leak basic-auth
-    # creds into log aggregators. Deferred — see plan file.
     logger.info(f"Searching STAC catalog: {catalog_url}")
     logger.info(f"Collection: {collection}")
     logger.info(f"Bbox: {bbox}")
@@ -192,9 +189,8 @@ def search_stac(
     if limit is not None:
         search_kw["max_items"] = limit
 
-    # pystac-client defers the HTTP call until item_collection() iterates, so
-    # both calls live inside the retry — a 503 partway through pagination
-    # restarts cleanly from a fresh client.
+    # Keep client creation inside the retry so transient pagination failures
+    # restart from a clean STAC request.
     def _do_search() -> list[pystac.Item]:
         client = PyStacClient.open(catalog_url)
         results = client.search(**search_kw)
@@ -333,9 +329,7 @@ def main(
 
         l1c_items = deduplicate_items(l1c_items)
 
-        # Sidecar flag for Argo. Written here (not in the except branch) so
-        # callers can distinguish "search succeeded with zero results" from
-        # "STAC API failed" — the latter still exits non-zero below.
+        # Only write the flag after a successful search.
         write_empty_flag(empty_flag_path, is_empty=len(l1c_items) == 0)
 
         if len(l1c_items) == 0:
@@ -371,4 +365,3 @@ def main(
 
 if __name__ == "__main__":
     main()
-

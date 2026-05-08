@@ -119,17 +119,12 @@ class TestWriteEmptyFlag:
         assert path.read_text() == "false"
 
     def test_no_op_when_path_is_none(self):
-        # Should not raise.
         utils.write_empty_flag(None, is_empty=True)
 
     def test_no_op_when_path_is_empty_string(self):
         utils.write_empty_flag("", is_empty=True)
 
     def test_swallows_oserror(self, tmp_path: Path, caplog):
-        # TODO: review report item #10 — set caplog level explicitly so this
-        # assertion isn't dependent on pytest's default propagation behaviour.
-        # Deferred — see plan file.
-        # Pointing into a non-existent directory triggers OSError on open.
         bogus = tmp_path / "does" / "not" / "exist" / "flag"
         utils.write_empty_flag(str(bogus), is_empty=True)
         assert any("Failed to write empty-flag" in r.message for r in caplog.records)
