@@ -161,6 +161,9 @@ def search_stac(
     Returns:
         List of STAC items matching the search criteria
     """
+    # TODO: review report item #7 — strip userinfo (urlparse._replace(netloc=...))
+    # before logging so a future credentialed catalog URL does not leak basic-auth
+    # creds into log aggregators. Deferred — see plan file.
     logger.info(f"Searching STAC catalog: {catalog_url}")
     logger.info(f"Collection: {collection}")
     logger.info(f"Bbox: {bbox}")
