@@ -102,7 +102,7 @@ $graph:
     id: run-pipeline
     requirements:
       DockerRequirement:
-        dockerPull: docker.io/earthdaily/methane-detection:v0.1.0
+        dockerPull: docker.io/earthdaily/methane-detection:v0.2.1
       InlineJavascriptRequirement: {}
       EnvVarRequirement:
         envDef:
